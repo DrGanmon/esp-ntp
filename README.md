@@ -136,6 +136,27 @@ Damit lässt sich ein stabiler serieller GPS-Versatz ausgleichen. **Eine tatsäc
 
 Die NTP-Unsicherheit schätzt sich aus vorgelagerter Root-Dispersion, halber Root-Verzögerung, halber lokaler Paketlaufzeit, 10 ms Reserve und 100 ppm seit der Übernahme. Sie ist keine gemessene Genauigkeit. Nach 60 Sekunden ohne gültige Übernahme von einer der beiden Quellen ist der Server unsynchronisiert. Beim Deaktivieren oder Ändern des Ersatzservers wird eine bisherige Ersatzzeit bis zur nächsten gültigen Übernahme verworfen.
 
+## GitHub-Builds und Versionen
+
+Der Workflow `.github/workflows/firmware.yml` führt bei Pushes, Pull Requests und manuell über **Actions → Firmware bauen und veröffentlichen → Run workflow** die nativen Tests aus und baut beide Boards. Unter den Artefakten des erfolgreichen Laufs steht das Paket **firmware** für 30 Tage zum Download bereit.
+
+Für jede Version einen Tag mit dem Präfix `v` auf den gewünschten Commit setzen und zu GitHub übertragen, beispielsweise nach dem Commit der Änderungen:
+
+```sh
+git tag -a v1.0.0 -m "Version 1.0.0"
+git push origin v1.0.0
+```
+
+Nach erfolgreichen Tests und beiden Builds erstellt der Workflow automatisch einen GitHub Release mit generierten Versionshinweisen und diesen Dateien:
+
+- `esp-ntp-d1-mini.bin`: Anwendungsfirmware für den Wemos D1 mini.
+- `esp-ntp-wt32-eth01.bin`: Anwendungsfirmware für den WT32-ETH01.
+- `SHA256SUMS`: SHA-256-Prüfsummen beider Dateien; nach dem Download mit `sha256sum --check SHA256SUMS` prüfen.
+
+Tags mit Bindestrich, etwa `v1.0.0-rc1`, erzeugen einen Vorabrelease. Ein erneut gestarteter Workflow aktualisiert die Dateien eines bereits vorhandenen Releases. Die Release-Dateien bleiben unabhängig von der 30-tägigen Artefaktaufbewahrung verfügbar. GitHub Actions muss im Repository aktiviert sein; der Release-Job verwendet das automatische `GITHUB_TOKEN` mit Schreibrecht für Repository-Inhalte, zusätzliche Secrets sind nicht nötig.
+
+Die `.bin` für das eigene Board kann direkt über die OTA-Webseite installiert werden. Die Dateien enthalten nur die Anwendung; für die erste serielle Installation einschließlich Bootloader und Partitionstabelle weiterhin PlatformIO verwenden.
+
 ## Firmware-Update im Browser (OTA)
 
 Diese Version einmal seriell installieren. Danach können weitere Firmware-Versionen über **Firmware aktualisieren** auf der normalen Statusseite hochgeladen werden. Die Funktion ist über die LAN-/WLAN-IP bzw. `http://gps-ntp.local/` erreichbar; über den Einrichtungs-AP werden keine Updates angenommen.

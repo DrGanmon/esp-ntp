@@ -1,0 +1,86 @@
+name: Firmware bauen und veröffentlichen
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Tests und beide Firmware-Dateien
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: PlatformIO installieren
+        run: python -m pip install 'platformio==6.1.18'
+      - name: Native Tests ausführen
+        shell: bash
+        run: |
+          set -euo pipefail
+          for source in tests/*_test.cpp; do
+            executable="$RUNNER_TEMP/$(basename "${source%.cpp}")"
+            g++ -std=c++11 -Wall -Wextra -Werror -Iinclude "$source" -o "$executable"
+            "$executable"
+          done
+      - name: D1 mini und WT32-ETH01 bauen
+        run: pio run -e d1_mini -e wt32_eth01
+      - name: Firmware und Prüfsummen vorbereiten
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp .pio/build/d1_mini/firmware.bin dist/esp-ntp-d1-mini.bin
+          cp .pio/build/wt32_eth01/firmware.bin dist/esp-ntp-wt32-eth01.bin
+          cd dist
+          sha256sum *.bin > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Version veröffentlichen
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: firmware-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: dist
+      - name: Release mit beiden Firmware-Dateien erstellen
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check SHA256SUMS
+          if gh release view "$VERSION" > /dev/null 2>&1; then
+            gh release upload "$VERSION" ./*.bin SHA256SUMS --clobber
+          else
+            options=(--verify-tag --title "$VERSION" --generate-notes)
+            if [[ "$VERSION" == *-* ]]; then
+              options+=(--prerelease)
+            fi
+            gh release create "$VERSION" ./*.bin SHA256SUMS "${options[@]}"
+          fi
