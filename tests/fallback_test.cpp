@@ -12,6 +12,7 @@ void reply(uint8_t *p, const uint8_t *nonce, uint32_t epoch) {
   memcpy(p + 24, nonce, 8);
   put32(p + 40, epoch + Fallback::EPOCH);
   put32(p + 44, 0xE0000000UL); // 875 ms
+  memcpy(p + 32, p + 40, 8); // zero server processing time unless overridden
   put32(p + 8, 65536); // 1 second upstream dispersion
 }
 int main() {
@@ -30,6 +31,11 @@ int main() {
   assert(Fallback::decode(packet, 48, nonce, 400000, result));
   assert(result.seconds == 1792195201UL && result.fractionUs == 75000);
   assert(result.stratum == 3 && result.leap == 0 && result.uncertaintyUs == 1210000);
+  // Server processing time must not be counted as network propagation.
+  put32(packet + 36, 0xC0000000UL); // receive 750 ms, transmit 875 ms: 125 ms processing
+  assert(Fallback::decode(packet, 48, nonce, 400000, result));
+  assert(result.delayUs == 275000 && result.fractionUs == 12500);
+  assert(!Fallback::decode(packet, 48, nonce, 100000, result));
   // The NTP seconds field wraps in 2036; contemporary Unix seconds must survive.
   reply(packet, nonce, 2208988800UL);
   assert(Fallback::decode(packet, 48, nonce, 0, result));
@@ -53,5 +59,10 @@ int main() {
   reply(packet, nonce, 0); assert(!Fallback::decode(packet, 48, nonce, 0, result));
   reply(packet, nonce, 1792195200UL);
   put32(packet + 8, 0xFFFF0000UL); assert(!Fallback::decode(packet, 48, nonce, 0, result));
+  reply(packet, nonce, 2085978496UL); // 2036 NTP era rollover
+  put32(packet + 40, 0); put32(packet + 44, 0x40000000UL);
+  put32(packet + 32, 0xFFFFFFFFUL); put32(packet + 36, 0xC0000000UL);
+  assert(Fallback::decode(packet, 48, nonce, 600000, result));
+  assert(result.seconds == 2085978496UL && result.fractionUs == 300000 && result.delayUs == 100000);
   puts("Fallback validation tests passed");
 }

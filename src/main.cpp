@@ -8,11 +8,22 @@
 #include <TinyGPSPlus.h>
 #include <time.h>
 #include <EEPROM.h>
+#include <Updater.h>
+#include <memory>
 #include "ntp_fallback.h"
+#include "nmea_timing.h"
+#include "gps_calibration.h"
 
 // GPS TX -> D5. RX is not needed. All GPIO signals must be 3.3 V.
 SoftwareSerial gpsSerial(D5, -1);
 TinyGPSPlus gps;
+NmeaTiming gpsTiming;
+uint32_t gpsWireCorrectionUs = 0, gpsTimingRejected = 0, gpsOverflows = 0;
+GpsCalibration gpsCalibration;
+uint32_t rawGpsSeconds = 0, rawGpsMicros = 0, lastNtpDelayUs = 0;
+bool gpsCalibrated = false, ntpMeasured = false;
+IPAddress calibrationAddress;
+uint8_t calibrationLeap = 0;
 TinyGPSCustom satellitesInView(gps, "GPGSV", 3);
 ESP8266WebServer web(80);
 DNSServer dns;
@@ -30,6 +41,12 @@ uint32_t lastGpsMillis = 0, baseUncertaintyUs = 1000000;
 uint8_t clockStratum = 1, clockLeap = 0;
 uint32_t resetAt = 0;
 bool resetPending = false;
+String otaPassword, otaError;
+constexpr char DEFAULT_OTA_PASSWORD[] = "gpsntp-update";
+std::unique_ptr<UpdaterClass> otaWriter;
+unsigned otaFiles = 0;
+bool otaEnded = false, otaRestartPending = false;
+uint32_t otaLastActivity = 0, otaRestartAt = 0;
 String apName;
 bool portal = false, mdns = false;
 bool wifiWasConnected = false;
@@ -59,6 +76,17 @@ uint32_t uncertaintyUs() {
   return baseUncertaintyUs + uint32_t(millis() - lastSyncMillis) / 10;
 }
 bool gpsFresh() { return gpsSeen && uint32_t(millis() - lastGpsMillis) < 5000; }
+void applyGpsReference() {
+  gpsCalibrated = gpsCalibration.ready(millis());
+  GpsCalibration::correctedAnchor(rawGpsSeconds, rawGpsMicros,
+                                  gpsCalibrated ? gpsCalibration.offsetUs : 0,
+                                  referenceSeconds, referenceMicros);
+  lastSyncMillis = lastGpsMillis; clockValid = true; networkTime = false;
+  baseUncertaintyUs = gpsCalibrated ? gpsCalibration.uncertaintyUs + gpsCalibration.age(millis()) / 10 : 1000000;
+  clockStratum = gpsCalibrated ? gpsCalibration.stratum : 1;
+  clockLeap = gpsCalibrated ? calibrationLeap : 0;
+  if (gpsCalibrated) referenceAddress = calibrationAddress;
+}
 bool saveFallback(const String &host) {
   // Dedicated EEPROM sector: version marker plus a NUL-terminated host name.
   EEPROM.write(0, 0xA7);
@@ -66,12 +94,40 @@ bool saveFallback(const String &host) {
   return EEPROM.commit();
 }
 void loadFallback() {
-  EEPROM.begin(68);
+  EEPROM.begin(136);
   if (EEPROM.read(0) != 0xA7) return;
   char host[64];
   for (size_t i = 0; i < sizeof(host); ++i) host[i] = EEPROM.read(i + 1);
   host[63] = 0;
   if (Fallback::validHost(host)) { fallbackHost = host; fallbackState = "bereit"; }
+}
+bool validOtaPassword(const String &password) {
+  if (password.length() < 8 || password.length() > 64) return false;
+  for (size_t i = 0; i < password.length(); ++i)
+    if (uint8_t(password[i]) < 33 || uint8_t(password[i]) > 126) return false;
+  return true;
+}
+bool saveOtaPassword(const String &password) {
+  uint8_t previous[66];
+  for (unsigned i = 0; i < sizeof(previous); ++i) previous[i] = EEPROM.read(68 + i);
+  EEPROM.write(68, 0xB6); EEPROM.write(69, password.length());
+  for (unsigned i = 0; i < 64; ++i) EEPROM.write(70 + i, i < password.length() ? password[i] : 0);
+  if (EEPROM.commit()) return true;
+  for (unsigned i = 0; i < sizeof(previous); ++i) EEPROM.write(68 + i, previous[i]);
+  return false;
+}
+void loadOtaPassword() {
+  uint8_t length = EEPROM.read(69);
+  String password;
+  if (EEPROM.read(68) == 0xB6 && length >= 8 && length <= 64)
+    for (unsigned i = 0; i < length; ++i) password += char(EEPROM.read(70 + i));
+  if (!validOtaPassword(password)) {
+    // Migrate the former randomly generated password to the documented default once.
+    password = DEFAULT_OTA_PASSWORD;
+    if (!saveOtaPassword(password)) { Serial.println("[OTA] Passwort konnte nicht gespeichert werden; OTA deaktiviert."); return; }
+  }
+  otaPassword = password;
+  Serial.println(otaPassword == DEFAULT_OTA_PASSWORD ? "[OTA] Standardpasswort aktiv (siehe README)." : "[OTA] Eigenes OTA-Passwort aktiv.");
 }
 void put32(uint8_t *p, uint32_t v) {
   p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
@@ -83,9 +139,18 @@ void timestamp(uint8_t *p) {
   put32(p + 4, (uint64_t(elapsed % 1000000UL) << 32) / 1000000UL);
 }
 void readGps() {
+  // Decode the ISR buffer before checking whether it overflowed.
+  gpsSerial.available();
+  bool overflow = gpsSerial.overflow();
+  if (overflow) ++gpsOverflows;
+  gpsTiming.service(micros(), overflow);
   // Bound work per loop so DNS, HTTP and NTP remain responsive.
   for (unsigned i = 0; i < 256 && gpsSerial.available(); ++i) {
-    if (!gps.encode(gpsSerial.read())) continue;
+    char c = gpsSerial.read();
+    uint32_t receivedAt = micros();
+    gpsTiming.observe(c, receivedAt);
+    if (!gps.encode(c) || !gpsTiming.isRmc()) continue;
+    if (!gpsTiming.usable(receivedAt)) { ++gpsTimingRejected; continue; }
     if (!gps.time.isUpdated() || !gps.date.isUpdated() || !gps.date.isValid() || !gps.time.isValid() ||
         gps.date.age() > 1500 || gps.time.age() > 500 ||
         !gps.location.isValid() || gps.location.age() > 2000 ||
@@ -93,17 +158,21 @@ void readGps() {
     uint32_t epoch = unixSeconds(gps.date.year(), gps.date.month(), gps.date.day(),
                                  gps.time.hour(), gps.time.minute(), gps.time.second());
     // GGA and RMC may describe the same second. Do not reset the phase twice.
-    if (clockValid && !networkTime && epoch == referenceSeconds) continue;
-    referenceSeconds = epoch;
-    referenceMicros = micros() - gps.time.centisecond() * 10000UL;
-    lastSyncMillis = millis();
-    clockValid = true;
-    gpsSeen = true; lastGpsMillis = millis(); networkTime = false;
-    baseUncertaintyUs = 1000000; clockStratum = 1; clockLeap = 0;
+    if (gpsSeen && epoch == rawGpsSeconds) continue;
+    gpsWireCorrectionUs = gpsTiming.correctionUs();
+    uint32_t anchor = receivedAt - gpsWireCorrectionUs - gps.time.centisecond() * 10000UL;
+    if (gpsSeen) {
+      int64_t phaseError = int64_t(uint32_t(anchor - rawGpsMicros)) -
+                           (int64_t(epoch) - rawGpsSeconds) * 1000000;
+      if (!gpsFresh() || phaseError < -20000 || phaseError > 20000) gpsCalibration.reset();
+    }
+    rawGpsSeconds = epoch; rawGpsMicros = anchor;
+    gpsSeen = true; lastGpsMillis = millis();
+    applyGpsReference();
   }
 }
 void pollFallback() {
-  if (!fallbackHost.length() || gpsFresh() || WiFi.status() != WL_CONNECTED) {
+  if (!fallbackHost.length() || WiFi.status() != WL_CONNECTED) {
     upstreamPending = false;
     upstreamAttempted = false;
     return;
@@ -119,13 +188,31 @@ void pollFallback() {
       if (upstream.remoteIP() == upstreamAddress && upstream.remotePort() == 123 &&
           count == 48 && Fallback::decode(packet, size, upstreamNonce,
                                          receivedMicros - upstreamSentMicros, sample)) {
-        referenceSeconds = sample.seconds;
-        referenceMicros = receivedMicros - sample.fractionUs;
-        lastSyncMillis = millis(); clockValid = true; networkTime = true;
-        baseUncertaintyUs = sample.uncertaintyUs;
-        clockStratum = sample.stratum; clockLeap = sample.leap;
-        referenceAddress = upstreamAddress;
-        upstreamPending = false; fallbackState = "Zeit empfangen";
+        lastNtpDelayUs = sample.delayUs;
+        ntpMeasured = true;
+        if (gpsFresh()) {
+          if (uint32_t(millis() - lastGpsMillis) < 1500) {
+            int64_t rawTime = int64_t(rawGpsSeconds) * 1000000 + uint32_t(receivedMicros - rawGpsMicros);
+            int64_t ntpTime = int64_t(sample.seconds) * 1000000 + sample.fractionUs;
+            if (gpsCalibration.add(ntpTime - rawTime, sample.delayUs, sample.uncertaintyUs,
+                                   sample.stratum, millis(), uint32_t(upstreamAddress), sample.leap)) {
+              calibrationAddress = IPAddress(gpsCalibration.referenceId);
+              calibrationLeap = gpsCalibration.leapIndicator;
+              applyGpsReference();
+              fallbackState = gpsCalibrated ? "GPS-Kalibrierung aktiv" : "sammle GPS-Vergleichsmessungen";
+            } else fallbackState = "Vergleich zu ungenau; Messung verworfen";
+          } else fallbackState = "GPS fuer Vergleich zu alt";
+        } else {
+          referenceSeconds = sample.seconds;
+          referenceMicros = receivedMicros - sample.fractionUs;
+          lastSyncMillis = millis(); clockValid = true; networkTime = true; gpsCalibrated = false;
+          baseUncertaintyUs = sample.uncertaintyUs;
+          clockStratum = sample.stratum; clockLeap = sample.leap;
+          referenceAddress = upstreamAddress;
+          fallbackState = "Zeit empfangen";
+        }
+        upstreamAttempted = true;
+        upstreamPending = false;
       } else fallbackState = "ungueltige Antwort";
     }
     if (upstreamPending && uint32_t(micros() - upstreamSentMicros) > 1500000) {
@@ -173,9 +260,9 @@ void serveNtp() {
   reply[0] = (valid ? (clockLeap << 6) : 0xC0) | (version << 3) | 4;
   reply[1] = valid ? clockStratum : 16;
   reply[2] = 6;
-  reply[3] = networkTime ? uint8_t(-10) : 0;
+  reply[3] = networkTime || gpsCalibrated ? uint8_t(-10) : 0;
   put32(reply + 8, valid ? (uint64_t(uncertaintyUs()) * 65536 / 1000000) : 0xFFFF0000UL);
-  if (networkTime) for (unsigned i = 0; i < 4; ++i) reply[12 + i] = referenceAddress[i];
+  if (networkTime || gpsCalibrated) for (unsigned i = 0; i < 4; ++i) reply[12 + i] = referenceAddress[i];
   else memcpy(reply + 12, "GPS", 3);
   if (clockValid) put32(reply + 16, referenceSeconds + NTP_EPOCH);
   memcpy(reply + 24, packet + 40, 8);
@@ -189,12 +276,16 @@ const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset=
 <style>body{font:17px system-ui;background:#101b2d;color:#edf4ff;max-width:760px;margin:40px auto;padding:20px}section{background:#1c2c43;padding:24px;border-radius:16px;margin:18px 0}h1{margin-bottom:6px}dl{display:grid;grid-template-columns:1fr 1fr;gap:14px}dd{margin:0;text-align:right}input,button{font:inherit;padding:12px;box-sizing:border-box;border-radius:8px;border:0;margin:6px 0;width:100%}button{background:#72dcbd;color:#10251f;cursor:pointer}small{color:#bac8db}#message{color:#72dcbd}</style>
 <h1>GPS → NTP</h1><small>Wemos D1 mini · u-blox NEO-6M · UTC</small>
 <section><h2 id="state">Status wird geladen …</h2><dl id="values"></dl><small>Die Unsicherheit ist eine konservative Planungsannahme, keine gemessene Genauigkeit. Ohne PPS können NMEA-Verzögerungen die Zeit verschieben.</small></section>
-<section><h2>Notfall-NTP</h2><form id="fallback"><label>NTP-Server (Hostname oder IPv4)<input id="fallbackHost" name="host" list="ntpServers" maxlength="63" placeholder="Leer = deaktiviert" autocomplete="off"></label><datalist id="ntpServers"><option value="pool.ntp.org"><option value="de.pool.ntp.org"></datalist><button>Notfall-NTP speichern</button></form><p id="fallbackMessage" role="status"></p><small>Aus der Vorschlagsliste wählen oder eigenen Server eintragen. GPS hat Vorrang. Nach 5 Sekunden ohne neue GPS-Zeit wird dieser Server alle 30 Sekunden abgefragt. Leer speichern deaktiviert den Ersatzserver.</small></section>
+<section><h2>Notfall-NTP und GPS-Kalibrierung</h2><form id="fallback"><label>NTP-Server (Hostname oder IPv4)<input id="fallbackHost" name="host" list="ntpServers" maxlength="63" placeholder="Leer = deaktiviert" autocomplete="off"></label><datalist id="ntpServers"><option value="pool.ntp.org"><option value="de.pool.ntp.org"></datalist><button>Notfall-NTP speichern</button></form><p id="fallbackMessage" role="status"></p><small>Der Server wird alle 30 Sekunden abgefragt: bei GPS-Empfang zur Kalibrierung, bei GPS-Ausfall als Ersatz. Ab drei stabilen Vergleichsmessungen wird die GPS-Zeit korrigiert. Ein naher, genauer NTP-Server verbessert die Voraussetzungen. Leer speichern deaktiviert auch die Kalibrierung. Millisekundengenauigkeit ist nicht garantiert.</small></section>
+<section><h2>Firmware aktualisieren</h2><form id="ota"><label>Firmware (.bin für D1 mini)<input id="firmware" type="file" accept=".bin" required></label><label>OTA-Passwort<input id="otaPassword" type="password" required autocomplete="off"></label><button>Firmware hochladen und neu starten</button></form><progress id="otaProgress" value="0" max="100" style="width:100%" hidden></progress><p id="otaMessage" role="status"></p><small>Das Standardpasswort steht in der README und kann unten geändert werden. WLAN und Notfall-NTP bleiben erhalten. Während des Updates die Stromversorgung aufrechterhalten.</small></section>
+<section><h2>OTA-Passwort ändern</h2><form id="changeOtaPassword"><label>Aktuelles Passwort<input id="currentOtaPassword" type="password" required autocomplete="current-password"></label><label>Neues Passwort<input name="password" id="newOtaPassword" type="password" minlength="8" maxlength="64" pattern="[!-~]{8,64}" required autocomplete="new-password"></label><label>Neues Passwort wiederholen<input name="confirmation" type="password" minlength="8" maxlength="64" required autocomplete="new-password"></label><button>OTA-Passwort speichern</button></form><p id="passwordMessage" role="status"></p><small>8–64 Zeichen: Buchstaben ohne Umlaute, Ziffern und ASCII-Sonderzeichen, keine Leerzeichen. Die Änderung gilt sofort und bleibt nach Neustart und WLAN-Reset erhalten.</small></section>
 <section><h2>WLAN zurücksetzen</h2><p>Löscht die gespeicherten WLAN-Zugangsdaten und startet das Gerät neu. Danach ist die Einrichtung wieder über den Access Point möglich. Der Notfall-NTP bleibt gespeichert.</p><button id="reset" style="background:#ffb1a8">WLAN löschen und neu starten</button><p id="resetMessage" role="status"></p></section>
 <script>
-const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
-let configLoaded=false,resetting=false;
-async function refresh(){if(resetting)return;try{let s=await(await fetch('/api/status',{cache:'no-store'})).json();document.querySelector('#state').textContent=s.synced?'Zeit verfügbar: '+s.source:'Nicht synchronisiert – warte auf Zeitquelle';if(!configLoaded){document.querySelector('#fallbackHost').value=s.fallbackHost==='deaktiviert'?'':s.fallbackHost;configLoaded=true}let dl=document.querySelector('#values');dl.replaceChildren();for(let[k,label]of fields){let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=s[k];dl.append(dt,dd)}}catch(e){document.querySelector('#state').textContent='Verbindung unterbrochen'}}
+const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['calibration','GPS-Kalibrierung'],['gpsOffset','GPS-Korrektur durch NTP'],['ntpDelay','NTP-Netzlaufzeit'],['calibrationSpread','Streuung der Vergleiche'],['wireCorrection','UART-Zeitkorrektur'],['timingRejected','Verzögerte GPS-Sätze verworfen'],['gpsOverflows','GPS-Pufferüberläufe'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
+let configLoaded=false,resetting=false,updating=false;
+async function refresh(){if(resetting||updating)return;try{let s=await(await fetch('/api/status',{cache:'no-store'})).json();document.querySelector('#state').textContent=s.synced?'Zeit verfügbar: '+s.source:'Nicht synchronisiert – warte auf Zeitquelle';if(!configLoaded){document.querySelector('#fallbackHost').value=s.fallbackHost==='deaktiviert'?'':s.fallbackHost;configLoaded=true}let dl=document.querySelector('#values');dl.replaceChildren();for(let[k,label]of fields){let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=s[k];dl.append(dt,dd)}}catch(e){document.querySelector('#state').textContent='Verbindung unterbrochen'}}
+document.querySelector('#ota').onsubmit=e=>{e.preventDefault();let file=document.querySelector('#firmware').files[0];if(!file||!file.size||!file.name.toLowerCase().endsWith('.bin')){document.querySelector('#otaMessage').textContent='Bitte eine nicht leere .bin-Datei auswählen.';return}if(!confirm('Firmware jetzt installieren und Gerät neu starten?'))return;updating=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);let progress=document.querySelector('#otaProgress'),message=document.querySelector('#otaMessage');progress.hidden=false;progress.value=0;message.textContent='Firmware wird hochgeladen …';let xhr=new XMLHttpRequest();xhr.open('POST','/update');xhr.timeout=180000;xhr.setRequestHeader('X-Device-Action','update');xhr.setRequestHeader('X-Update-Password',document.querySelector('#otaPassword').value);xhr.setRequestHeader('X-Firmware-Size',String(file.size));xhr.upload.onprogress=e=>{if(e.lengthComputable){progress.value=Math.round(e.loaded/e.total*100);message.textContent=progress.value===100?'Upload vollständig. Firmware wird geprüft …':'Upload: '+progress.value+' %'}};const unlock=()=>{updating=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)};xhr.onload=()=>{document.querySelector('#otaPassword').value='';message.textContent=xhr.responseText;if(xhr.status===200){resetting=true;message.textContent+=' Seite nach dem Neustart neu laden.'}else unlock()};xhr.onerror=xhr.ontimeout=xhr.onabort=()=>{message.textContent='Keine Bestätigung erhalten. Verbindung prüfen und Seite neu laden, bevor du erneut aktualisierst.';unlock()};let data=new FormData();data.append('firmware',file);xhr.send(data)};
+document.querySelector('#changeOtaPassword').onsubmit=async e=>{e.preventDefault();let form=e.target,data=new FormData(form),message=document.querySelector('#passwordMessage');if(data.get('password')!==data.get('confirmation')){message.textContent='Die neuen Passwörter stimmen nicht überein.';return}let button=form.querySelector('button');button.disabled=true;try{let r=await fetch('/ota-password',{method:'POST',headers:{'X-Device-Action':'change-password','X-Update-Password':document.querySelector('#currentOtaPassword').value},body:new URLSearchParams(data)});message.textContent=await r.text();if(r.ok){form.reset();document.querySelector('#otaPassword').value=''}}catch(e){message.textContent='Keine Bestätigung erhalten. Bei erneutem Versuch gegebenenfalls das neue Passwort verwenden.'}finally{button.disabled=false}};
 async function postForm(form,path,message,action){let button=form.querySelector('button');button.disabled=true;try{let r=await fetch(path,{method:'POST',headers:action?{'X-Device-Action':action}:{},body:new URLSearchParams(new FormData(form))});document.querySelector(message).textContent=await r.text();if(r.ok)refresh()}catch(e){document.querySelector(message).textContent='Verbindung unterbrochen'}finally{button.disabled=false}}
 document.querySelector('#fallback').onsubmit=e=>{e.preventDefault();postForm(e.target,'/fallback','#fallbackMessage','configure')};
 document.querySelector('#reset').onclick=async()=>{if(!confirm('WLAN-Zugangsdaten wirklich löschen und neu starten?'))return;let button=document.querySelector('#reset');button.disabled=true;try{let r=await fetch('/reset-wifi',{method:'POST',headers:{'X-Device-Action':'reset'}});document.querySelector('#resetMessage').textContent=await r.text();if(r.ok){resetting=true;document.querySelector('#state').textContent='Neustart – bitte mit dem Einrichtungs-AP verbinden.'}else button.disabled=false}catch(e){document.querySelector('#resetMessage').textContent='Keine Bestätigung erhalten. Verbindung prüfen.';button.disabled=false}};
@@ -233,6 +324,58 @@ String jsonString(const String &value) {
 bool setupClient() {
   // Select by the address this HTTP connection reached, not station connectivity.
   return portal && web.client().localIP() == WiFi.softAPIP();
+}
+bool otaAllowed(const char *action = "update") {
+  return WiFi.status() == WL_CONNECTED && !setupClient() && !resetPending &&
+         !otaRestartPending && otaPassword.length() &&
+         web.header("X-Device-Action") == action && web.header("X-Update-Password") == otaPassword;
+}
+void uploadFirmware() {
+  if (!otaAllowed()) return;
+  HTTPUpload &upload = web.upload();
+  otaLastActivity = millis();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (++otaFiles != 1) { otaError = "Nur eine Firmware-Datei pro Update erlaubt."; otaWriter.reset(); return; }
+    otaError = ""; otaEnded = false;
+    String filename = upload.filename; filename.toLowerCase();
+    String sizeHeader = web.header("X-Firmware-Size");
+    bool numeric = sizeHeader.length() > 0 && sizeHeader.length() <= 8;
+    for (size_t i = 0; i < sizeHeader.length(); ++i) if (sizeHeader[i] < '0' || sizeHeader[i] > '9') numeric = false;
+    uint32_t size = numeric ? strtoul(sizeHeader.c_str(), nullptr, 10) : 0;
+    uint32_t freeSpace = ESP.getFreeSketchSpace();
+    uint32_t maximum = freeSpace > 0x1000 ? (freeSpace - 0x1000) & 0xFFFFF000 : 0;
+    if (upload.name != "firmware" || !filename.endsWith(".bin") || size < 16 || size > maximum) {
+      otaError = "Ungueltige Firmware-Datei oder Dateigroesse (D1-mini-.bin erforderlich)."; return;
+    }
+    otaWriter.reset(new UpdaterClass());
+    if (!otaWriter->begin(size, U_FLASH)) { otaError = otaWriter->getErrorString(); otaWriter.reset(); }
+    else Serial.printf("[OTA] Upload gestartet: %lu Bytes\n", static_cast<unsigned long>(size));
+  } else if (upload.status == UPLOAD_FILE_WRITE && otaWriter && !otaError.length()) {
+    if (otaWriter->write(upload.buf, upload.currentSize) != upload.currentSize) {
+      otaError = otaWriter->getErrorString(); otaWriter.reset();
+    }
+  } else if (upload.status == UPLOAD_FILE_END && otaWriter && !otaError.length()) {
+    otaEnded = true; // Commit only after the entire multipart request has finished.
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    otaWriter.reset(); otaFiles = 0; otaEnded = false;
+    otaError = "Upload abgebrochen."; Serial.println("[OTA] Upload abgebrochen.");
+  }
+  yield();
+}
+void finishFirmware() {
+  web.sendHeader("Cache-Control", "no-store");
+  if (!otaAllowed()) { web.send(403, "text/plain; charset=utf-8", "Update nur ueber WLAN-IP mit gueltigem OTA-Passwort erlaubt."); return; }
+  bool success = otaFiles == 1 && otaEnded && otaWriter && !otaError.length();
+  if (success && !otaWriter->end()) { otaError = otaWriter->getErrorString(); success = false; }
+  otaWriter.reset(); otaFiles = 0; otaEnded = false;
+  if (!success) {
+    web.send(400, "text/plain; charset=utf-8", "Update fehlgeschlagen: " + (otaError.length() ? otaError : String("Firmware unvollstaendig oder fehlt.")));
+    otaError = ""; return;
+  }
+  Serial.println("[OTA] Firmware geprueft. Neustart.");
+  web.sendHeader("Connection", "close");
+  web.send(200, "text/plain; charset=utf-8", "Firmware installiert. Das Geraet startet neu.");
+  otaRestartAt = millis(); otaRestartPending = true;
 }
 void home() {
   web.sendHeader("Cache-Control", "no-store");
@@ -286,15 +429,22 @@ void status() {
   String json = "{\"synced\":" + String(synchronized() ? "true" : "false");
   auto field = [&json](const char *key, const String &value) { json += ",\"" + String(key) + "\":\"" + value + "\""; };
   field("utc", utc);
-  field("source", synchronized() ? (networkTime ? "Notfall-NTP" : "GPS (NMEA)") : "keine");
+  field("source", synchronized() ? (networkTime ? "Notfall-NTP" : gpsCalibrated ? "GPS + NTP-Kalibrierung" : "GPS (NMEA)") : "keine");
   field("stratum", synchronized() ? String(clockStratum) : "16 (unsynchronisiert)");
   field("fallbackHost", fallbackHost.length() ? fallbackHost : "deaktiviert");
-  field("fallbackState", !fallbackHost.length() ? "deaktiviert" : gpsFresh() ? "GPS hat Vorrang" :
+  field("fallbackState", !fallbackHost.length() ? "deaktiviert" :
         WiFi.status() != WL_CONNECTED ? "warte auf WLAN" : fallbackState);
   field("satellites", gps.satellites.isValid() && gps.satellites.age() < 5000 ? String(gps.satellites.value()) : "—");
   field("visible", satellitesInView.isValid() && satellitesInView.age() < 5000 ? String(satellitesInView.value()) : "—");
   field("hdop", gps.hdop.isValid() && gps.hdop.age() < 5000 ? String(gps.hdop.hdop(), 1) : "—");
-  field("uncertainty", synchronized() ? String(uncertaintyUs() / 1000) + (networkTime ? " ms (NTP-Schaetzung)" : " ms (ohne PPS)") : "unbekannt");
+  field("uncertainty", synchronized() ? String(uncertaintyUs() / 1000.0, 2) + (networkTime || gpsCalibrated ? " ms (NTP-Schaetzung)" : " ms (ohne PPS)") : "unbekannt");
+  field("calibration", gpsCalibration.ready(millis()) ? "bereit" : "nicht bereit (" + String(gpsCalibration.sampleCount()) + "/5 Messungen)");
+  field("gpsOffset", gpsCalibrated ? String(gpsCalibration.offsetUs / 1000.0, 2) + " ms" : "—");
+  field("ntpDelay", ntpMeasured ? String(lastNtpDelayUs / 1000.0, 2) + " ms" : "—");
+  field("calibrationSpread", gpsCalibration.ready(millis()) ? String(gpsCalibration.spreadUs / 1000.0, 2) + " ms" : "—");
+  field("wireCorrection", synchronized() && !networkTime ? String(gpsWireCorrectionUs / 1000.0, 2) + " ms" : "—");
+  field("timingRejected", String(gpsTimingRejected));
+  field("gpsOverflows", String(gpsOverflows));
   field("age", clockValid ? String((millis() - lastSyncMillis) / 1000) + " s" : "—");
   field("ip", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "nicht verbunden");
   field("ap", portal ? WiFi.softAPIP().toString() : "aus");
@@ -307,9 +457,11 @@ void setup() {
   delay(200);
   Serial.println("\n[BOOT] GPS-NTP startet");
   Serial.printf("[BOOT] Reset-Ursache: %s\n", ESP.getResetReason().c_str());
-  gpsSerial.begin(9600);
+  gpsSerial.begin(9600, SWSERIAL_8N1, D5, -1, false, 128, 1024);
   loadFallback();
+  loadOtaPassword();
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.hostname("gps-ntp");
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.setAutoReconnect(true); WiFi.begin();
   apName = "GPS-NTP-" + String(ESP.getChipId(), HEX);
   disconnectedAt = millis();
@@ -337,7 +489,20 @@ void setup() {
              ",\"ip\":" + jsonString(connected ? WiFi.localIP().toString() : "") + "}");
   });
   web.on("/api/status", HTTP_GET, status);
-  web.collectHeaders("X-Device-Action");
+  web.collectHeaders("X-Device-Action", "X-Update-Password", "X-Firmware-Size");
+  web.on("/update", HTTP_POST, finishFirmware, uploadFirmware);
+  web.on("/ota-password", HTTP_POST, [] {
+    web.sendHeader("Cache-Control", "no-store");
+    if (!otaAllowed("change-password")) { web.send(403, "text/plain; charset=utf-8", "Aktuelles OTA-Passwort falsch oder Zugriff nicht ueber WLAN-IP."); return; }
+    if (otaFiles) { web.send(409, "text/plain", "Firmware-Upload noch aktiv. Bitte kurz warten."); return; }
+    String password = web.arg("password");
+    if (!validOtaPassword(password) || password != web.arg("confirmation")) {
+      web.send(400, "text/plain; charset=utf-8", "Passwoerter muessen uebereinstimmen: 8–64 druckbare ASCII-Zeichen ohne Leerzeichen."); return;
+    }
+    if (!saveOtaPassword(password)) { web.send(500, "text/plain", "Passwort konnte nicht gespeichert werden."); return; }
+    otaPassword = password;
+    web.send(200, "text/plain; charset=utf-8", "OTA-Passwort gespeichert. Fuer Updates und weitere Aenderungen gilt ab sofort das neue Passwort.");
+  });
   web.on("/fallback", HTTP_POST, [] {
     if (web.header("X-Device-Action") != "configure") { web.send(403, "text/plain", "Aktion nicht erlaubt."); return; }
     String host = web.arg("host"); host.trim();
@@ -346,8 +511,10 @@ void setup() {
     }
     if (!saveFallback(host)) { web.send(500, "text/plain", "Speichern fehlgeschlagen."); return; }
     fallbackHost = host; upstreamPending = false; upstreamAttempted = false; upstream.stop();
+    gpsCalibration.reset(); ntpMeasured = false;
     fallbackState = host.length() ? "bereit" : "deaktiviert";
     if (networkTime) clockValid = false;
+    else if (gpsSeen) applyGpsReference();
     web.send(200, "text/plain; charset=utf-8", host.length() ? "Notfall-NTP gespeichert." : "Notfall-NTP deaktiviert.");
   });
   web.on("/reset-wifi", HTTP_POST, [] {
@@ -379,11 +546,21 @@ void setup() {
   Serial.printf("[BOOT] HTTP bereit; NTP-Port: %s\n", ntp.begin(123) ? "bereit" : "Fehler");
 }
 void loop() {
+  if (otaRestartPending) {
+    if (uint32_t(millis() - otaRestartAt) >= 1000) ESP.restart();
+    yield(); return;
+  }
+  if (otaFiles && uint32_t(millis() - otaLastActivity) > 30000) {
+    otaWriter.reset(); otaFiles = 0; otaEnded = false;
+    Serial.println("[OTA] Unvollstaendiger Upload verworfen (Timeout).");
+  }
   if (resetPending && uint32_t(millis() - resetAt) >= 500) {
     WiFi.persistent(true); WiFi.disconnect(true); WiFi.persistent(false);
     ESP.restart(); return;
   }
   readGps();
+  if (!networkTime && gpsCalibrated && !gpsCalibration.ready(millis())) applyGpsReference();
+  serveNtp();
   pollFallback();
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiWasConnected) {
@@ -401,7 +578,9 @@ void loop() {
     if (mdns) { MDNS.close(); mdns = false; }
   }
   if (portal) dns.processNextRequest();
-  web.handleClient(); serveNtp(); if (mdns) MDNS.update(); yield();
+  readGps(); serveNtp();
+  web.handleClient();
+  readGps(); serveNtp(); if (mdns) MDNS.update(); yield();
   if (uint32_t(millis() - lastDiagnostic) >= 10000) {
     lastDiagnostic = millis();
     Serial.printf("[STATUS] Laufzeit=%lu s WLAN=%d AP=%s AP-IP=%s GPS-Zeichen=%lu Heap=%lu\n",
