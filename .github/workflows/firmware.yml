@@ -40,6 +40,7 @@ jobs:
           mkdir -p dist
           cp .pio/build/d1_mini/firmware.bin dist/esp-ntp-d1-mini.bin
           cp .pio/build/wt32_eth01/firmware.bin dist/esp-ntp-wt32-eth01.bin
+          cp LICENSE COPYING THIRD_PARTY.md dist/
           cd dist
           sha256sum *.bin > SHA256SUMS
       - uses: actions/upload-artifact@v4
@@ -76,11 +77,11 @@ jobs:
           cd dist
           sha256sum --check SHA256SUMS
           if gh release view "$VERSION" > /dev/null 2>&1; then
-            gh release upload "$VERSION" ./*.bin SHA256SUMS --clobber
+            gh release upload "$VERSION" ./* --clobber
           else
             options=(--verify-tag --title "$VERSION" --generate-notes)
             if [[ "$VERSION" == *-* ]]; then
               options+=(--prerelease)
             fi
-            gh release create "$VERSION" ./*.bin SHA256SUMS "${options[@]}"
+            gh release create "$VERSION" ./* "${options[@]}"
           fi

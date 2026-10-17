@@ -4,6 +4,20 @@ ESP8266-Firmware für einen lokalen NTP-Server (UDP 123), der UTC vom u-blox NEO
 
 Zusätzlich wird das **WT32-ETH01 (ESP32 mit LAN8720-Ethernet)** unterstützt. Beide Boards verwenden dieselben Webfunktionen einschließlich Captive Portal, NTP-Kalibrierung, Satellitenansicht und Web-OTA. Ethernet hat beim WT32 Vorrang vor einer vorhandenen WLAN-Verbindung.
 
+## Lizenz
+
+Der eigene Projektcode steht wie bei ESPEasy unter **GNU GPL Version 3 oder
+jeder späteren Version (`GPL-3.0-or-later`)**. Kommerzielle Nutzung ist erlaubt;
+bei Weitergabe gelten die Copyleft- und Quellcodepflichten der GPL.
+
+Es gelten [LICENSE](LICENSE) und der vollständige GPLv3-Text in
+[COPYING](COPYING). Fremdkomponenten behalten ihre eigenen Lizenzen.
+Hinweise zu Abhängigkeiten und Firmware-Weitergabe stehen in
+[THIRD_PARTY.md](THIRD_PARTY.md). Eine eigene SDK-Linking-Ausnahme wird nicht erteilt.
+
+Die Projektlizenztexte werden den GitHub-Build-Artefakten und Releases beigelegt.
+Sie ersetzen kein vollständiges Paket der erforderlichen Fremdlizenzen und Quellen.
+
 ## WT32-ETH01
 
 | GPS | WT32-ETH01 |
