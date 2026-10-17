@@ -84,6 +84,26 @@ Vorausgesetzt wird die Werkskonfiguration: **1 Hz, steigende Flanke auf der UTC-
 
 Die Statusseite zeigt **PPS (optional)** und bei erfolgreicher Zuordnung **GPS + PPS** als Zeitquelle. PPS hat Vorrang vor der NTP-Kalibrierung; die serielle Übertragungsverzögerung geht dann nicht in den Zeitanker ein. NTP dient weiterhin als Plausibilitätskontrolle. Widerspricht eine ausreichend genaue NTP-Antwort der PPS-Zeit um mehr als 0,5 s, wird die Zuordnung verworfen und PPS für 60 Sekunden gesperrt. Ohne unabhängige Referenz kann eine ganze Sekunde falsche Zuordnung nicht sicher ausgeschlossen werden.
 
+### Hardware-Capture und Frequenzregelung
+
+Beim WT32 erfasst **MCPWM0 Capture-Kanal 0** die steigende PPS-Flanke direkt in Hardware. **Kanal 1** ist für Software-Ablesungen desselben frei laufenden 80-MHz-Capture-Timers reserviert. GPS-Zeitanker, NTP-Vergleiche und NTP-Paketzeitstempel verwenden diese gemeinsame Zeitbasis. Der Interrupt übergibt nur den bereits gespeicherten Flankenwert; eine verzögerte Ausführung verschiebt dadurch nicht die gespeicherte Flanke. Der 32-Bit-Hardwarezähler wird regelmäßig in Software erweitert, bevor er nach ungefähr 53,7 Sekunden überläuft. Deep Sleep und Änderungen der Capture-Konfiguration während des Betriebs werden nicht unterstützt. Bei aktivierter dynamischer Energieverwaltung wird die maximale APB-Frequenz gesperrt. Die beiden Capture-Kanäle dürfen nicht parallel von anderen Funktionen verwendet werden.
+
+Falls Hardware-Capture nicht initialisiert werden kann, verwendet das WT32 automatisch wieder den GPIO-Interrupt mit `micros()`. Der D1 mini verwendet grundsätzlich diesen Interruptpfad. **PPS-Zeiterfassung** zeigt die tatsächlich verwendete Methode an.
+
+Nach bestätigter PPS-/UTC-Zuordnung lernt die Firmware den lokalen Gangfehler über **16 aufeinanderfolgende Einsekundenintervalle**. Ein Intervall muss innerhalb ±500 µs um eine Sekunde liegen; die Differenz zwischen längstem und kürzestem Intervall darf im Lernfenster höchstens 100 µs betragen. Das entspricht nach der anfänglichen PPS-Zuordnung etwa weiteren 16 Sekunden Lernzeit. Folgende Fenster aktualisieren den geschätzten Fehler mit einem Viertel ihres Unterschieds zum bisherigen Wert. Positive ppm bedeuten: Der lokale Timer läuft zu schnell; die verstrichene lokale Zeit wird bei der NTP-Berechnung entsprechend verkürzt.
+
+Die Frequenzkorrektur wird nur für aktive PPS-Zeit angewendet und bei fehlender UTC-Zuordnung, unplausiblen Intervallen, großen Schwankungen oder nach spätestens 60 Sekunden ohne neues gültiges Lernfenster verworfen. Sie ersetzt keine sichere Zuordnung des Pulses zur UTC-Sekunde und setzt nach PPS-Ausfall die Uhr nicht eigenständig fort. **Frequenzkorrektur** und **PPS-Intervallstreuung** zeigen Lernzustand, ppm und gemessene Intervallstreuung; diese Streuung ist keine absolute UTC-Fehlermessung.
+
+### NTP-Zeitstempel im Netzwerkstack
+
+Auf dem WT32 verwendet der NTP-Server einen eigenen lwIP-UDP-Empfangspfad. Der Empfangszeitpunkt wird beim Aufruf des UDP-Empfangs-Callbacks erfasst, bevor das Paket zur Bearbeitung an den Zeit-Task übergeben wird. Eine feste Warteschlange fasst zwölf Anfragen. Für die Antwort wird ein unveränderlicher Zeitanker einschließlich Frequenzkorrektur an den lwIP-Sendepfad übergeben; der Sendezeitstempel wird dort nach der Pufferreservierung unmittelbar vor der UDP-Übergabe gesetzt. Die lwIP-Callbacks nehmen keinen Anwendungs-Zeitdaten-Mutex, um gegenseitiges Blockieren der Kerne zu vermeiden. Um alte Antworten zu vermeiden, werden Anfragen und Sendeaufträge mit mehr als 20 ms interner Wartezeit verworfen.
+
+Der D1 mini bleibt bei der Arduino-UDP-API: Der Empfang wird innerhalb des Abholaufrufs angenähert, der Sendezeitstempel nach Vorbereitung der UDP-Verbindung gesetzt. Die gemeinsame Zeitrechnung berücksichtigt auch Anfragen, deren Empfang vor dem jüngsten PPS-Zeitanker liegt, sowie positive und negative Frequenzfehler und Timerüberläufe.
+
+**NTP-Zeitstempel** zeigt den Pfad an; **NTP verworfen / Sendefehler** zählt beim WT32 Warteschlangenüberläufe, veraltete Aufträge, Pufferfehler und fehlgeschlagene Sendeübergaben. Der normale Antwortzähler zählt beim WT32 erfolgreich eingereihte Antworten, nicht nachweislich beim Client eingetroffene Pakete. Diese Softwarezeitstempel liegen näher am Netzwerkstack, sind aber keine Hardware-Zeitstempel am Ethernet-MAC/PHY. Ethernet-Warteschlangen, Übertragungsdauer und der Netzwerkweg bleiben zusätzliche Fehlerquellen.
+
+Die bisherige PPS-Unsicherheitsannahme von 2 ms wird trotz dieser Verbesserungen beibehalten, bis unabhängige Messungen vorliegen. Ein kleinerer angezeigter Zahlenwert allein wäre keine Genauigkeitsverbesserung.
+
 Fehlen passende RMC-Sätze, fallen Pulse aus oder wird die Impulsfolge unplausibel, erfolgt automatisch der Rückfall auf NMEA mit gegebenenfalls vorhandener NTP-Kalibrierung bzw. bei GPS-Ausfall auf Notfall-NTP. Spätestens 1,5 Sekunden nach dem letzten zugeordneten Puls wird PPS nicht mehr als aktive Zeitquelle verwendet. Es werden keine Sekunden allein aus unbestätigten Pulsen fortgeschrieben. Für PPS werden vorläufig **2 ms plus 100 ppm seit der letzten Übernahme** als technische Unsicherheit angesetzt. Das ist keine gemessene Genauigkeit; WLAN- und Interruptlatenz bleiben zu prüfen. Die Firmware stellt die PPS-Konfiguration des GPS-Moduls nicht selbst um.
 
 ## Position und Satellitenhimmel
@@ -154,6 +174,8 @@ Für höhere GPS-Genauigkeit unabhängig von der seriellen Ausgabeverzögerung u
 - Falsches Passwort und WLAN-Ausfall: Portal bleibt bzw. wird erneut erreichbar.
 - Unter freiem Himmel Satelliten und plausibles UTC-Datum prüfen.
 - Optional PPS mit D6/GPIO12 (D1 mini) bzw. GPIO33 (WT32) verbinden: nach drei stabilen Zuordnungen muss GPS + PPS erscheinen. PPS abziehen oder GPS-TX trennen: automatische Rückkehr zur bisherigen Zeitquelle prüfen. Korrekte UTC-Sekunde gegen eine unabhängige Referenz kontrollieren, insbesondere nach Änderungen der GPS-Konfiguration.
+- Auf dem WT32 muss PPS-Zeiterfassung MCPWM-Hardware melden; nach etwa 16 weiteren stabilen Intervallen muss eine Frequenzkorrektur in ppm erscheinen. Lauf über mehrere Minuten prüfen, damit Capture-Zählerüberläufe erfasst werden. PPS trennen: die Frequenzkorrektur darf nach dem Rückfall nicht weiter angewendet werden.
+- NTP-Offset, Streuung und maximale Ausreißer gegen eine unabhängige Referenz vor/nach dem Update vergleichen, sowohl ohne Last als auch mit wiederholten HTTP-Zugriffen. Beim WT32 Zähler für verworfene NTP-Aufträge unter Last kontrollieren. OTA separat prüfen; Flash-Schreiben kann weiterhin die Zeitverarbeitung beeinflussen.
 - Position und Höhe gegen einen bekannten Standort vergleichen. Im Satellitenhimmel müssen 0° Azimut oben und 90° rechts liegen; Satelliten bei 90° Elevation erscheinen in der Mitte. GPS-TX trennen: Position muss nach fünf Sekunden verschwinden, die Himmelsansicht nach zehn Sekunden.
 - Mit einem NTP-Client Synchronisationsstatus und Abweichung gegen eine unabhängige Quelle messen.
 - Bei laufendem GPS einen genauen NTP-Server eintragen: nach mindestens drei stabilen Vergleichen muss die Quelle auf GPS + NTP-Kalibrierung wechseln. Korrektur, Laufzeit, Streuung und NTP-Stratum prüfen. Den NTP-Server anschließend unerreichbar machen: spätestens nach Ablauf der Vergleichswerte muss die konservative GPS-Unsicherheit zurückkehren. Serverfeld leeren: Kalibrierung muss sofort verschwinden.
@@ -180,6 +202,8 @@ g++ -std=c++11 -Wall -Wextra -Iinclude tests/pps_clock_test.cpp -o /tmp/esp-ntp-
 /tmp/esp-ntp-pps-test
 g++ -std=c++11 -Wall -Wextra -Iinclude tests/ip_config_test.cpp -o /tmp/esp-ntp-ip-test
 /tmp/esp-ntp-ip-test
+g++ -std=c++11 -Wall -Wextra -Iinclude tests/precision_clock_test.cpp -o /tmp/esp-ntp-precision-test
+/tmp/esp-ntp-precision-test
 ```
 
 Grundlagen: [u-blox NEO-6 Datenblatt](https://content.u-blox.com/sites/default/files/products/documents/NEO-6_DataSheet_%28GPS.G6-HW-09005%29.pdf), [TinyGPSPlus](https://github.com/mikalhart/TinyGPSPlus), [ESP8266 Arduino Core](https://github.com/esp8266/Arduino).

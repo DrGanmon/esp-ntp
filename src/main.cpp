@@ -13,15 +13,28 @@
 #include "pps_clock.h"
 #include "ip_config.h"
 #include "network_page.h"
+#include "precision_capture.h"
+#include "precision_ntp.h"
+#include "frequency_discipline.h"
 #ifndef GPS_PPS_ENABLED
 #define GPS_PPS_ENABLED 1
 #endif
 PpsClock ppsClock;
+FrequencyDiscipline frequencyDiscipline;
 bool ppsTime = false;
 bool ppsBlocked = false;
 uint32_t ppsBlockedAt = 0;
 #if GPS_PPS_ENABLED
 volatile uint32_t ppsEdgeMicros = 0, ppsSequence = 0;
+#ifdef ESP32
+volatile uint32_t ppsCapturedTicks = 0;
+bool IRAM_ATTR onCapturedPps(mcpwm_unit_t, mcpwm_capture_channel_id_t, const cap_event_data_t *event, void *) {
+  portENTER_CRITICAL_ISR(&ppsMux);
+  ppsCapturedTicks = event->cap_value; ++ppsSequence;
+  portEXIT_CRITICAL_ISR(&ppsMux);
+  return false;
+}
+#endif
 void IRAM_ATTR onPps() {
 #ifdef ESP32
   portENTER_CRITICAL_ISR(&ppsMux);
@@ -41,9 +54,15 @@ void capturePps() {
 #endif
   uint32_t edge = ppsEdgeMicros, sequence = ppsSequence;
 #ifdef ESP32
+  uint32_t ticks = ppsCapturedTicks;
+#endif
+#ifdef ESP32
   portEXIT_CRITICAL(&ppsMux);
 #else
   interrupts();
+#endif
+#ifdef ESP32
+  if (hardwareCapture && sequence) edge = capturedEdgeMicros(ticks);
 #endif
   if (sequence) ppsClock.pulse(edge, sequence);
 #endif
@@ -66,7 +85,11 @@ IPAddress calibrationAddress;
 uint8_t calibrationLeap = 0;
 DeviceWebServer web(80);
 DNSServer dns;
+#ifdef ESP32
+PrecisionNtp ntp;
+#else
 WiFiUDP ntp;
+#endif
 WiFiUDP upstream;
 String fallbackHost;
 String fallbackState = "deaktiviert";
@@ -153,7 +176,7 @@ uint32_t uncertaintyUs() {
 }
 bool gpsFresh() { return gpsSeen && uint32_t(millis() - lastGpsMillis) < 5000; }
 void applyGpsReference() {
-  ppsTime = ppsClock.locked(micros());
+  ppsTime = ppsClock.locked(clockMicros());
   if (ppsTime) {
     referenceSeconds = ppsClock.referenceSeconds; referenceMicros = ppsClock.referenceMicros;
     lastSyncMillis = lastGpsMillis; clockValid = true; networkTime = false; gpsCalibrated = false;
@@ -215,12 +238,13 @@ void loadOtaPassword() {
 void put32(uint8_t *p, uint32_t v) {
   p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
 }
-void timestamp(uint8_t *p) {
-  if (!clockValid) { memset(p, 0, 8); return; }
-  uint32_t elapsed = micros() - referenceMicros;
-  put32(p, referenceSeconds + NTP_EPOCH + elapsed / 1000000UL);
-  put32(p + 4, (uint64_t(elapsed % 1000000UL) << 32) / 1000000UL);
+ClockMapping clockMapping(uint32_t now) {
+  ClockMapping result;
+  result.seconds = referenceSeconds; result.micros = referenceMicros; result.valid = synchronized();
+  result.ratePpb = ppsTime && frequencyDiscipline.ready(now) ? frequencyDiscipline.ratePpb : 0;
+  return result;
 }
+void timestamp(uint8_t *p, uint32_t now) { clockMapping(now).timestamp(p, now); }
 void readGps() {
   // Decode the ISR buffer before checking whether it overflowed.
   gpsSerial.available();
@@ -230,11 +254,11 @@ void readGps() {
   bool overflow = gpsSerial.overflow();
 #endif
   if (overflow) { ++gpsOverflows; satelliteView.invalidateCycle(); }
-  gpsTiming.service(micros(), overflow);
+  gpsTiming.service(clockMicros(), overflow);
   // Bound work per loop so DNS, HTTP and NTP remain responsive.
   for (unsigned i = 0; i < 256 && gpsSerial.available(); ++i) {
     char c = gpsSerial.read();
-    uint32_t receivedAt = micros();
+    uint32_t receivedAt = clockMicros();
     gpsTiming.observe(c, receivedAt);
     satelliteView.encode(c, millis());
     if (!gps.encode(c) || !gpsTiming.isRmc()) continue;
@@ -257,8 +281,11 @@ void readGps() {
     rawGpsSeconds = epoch; rawGpsMicros = anchor;
     capturePps();
     if (ppsBlocked && uint32_t(millis() - ppsBlockedAt) >= 60000) ppsBlocked = false;
-    if (!ppsBlocked) ppsClock.associate(epoch, receivedAt - gpsWireCorrectionUs, gps.time.centisecond());
+    bool ppsAssociated = false;
+    if (!ppsBlocked) ppsAssociated = ppsClock.associate(epoch, receivedAt - gpsWireCorrectionUs, gps.time.centisecond());
     else ppsClock.reset();
+    if (ppsAssociated) frequencyDiscipline.observe(epoch, ppsClock.referenceMicros);
+    else frequencyDiscipline.reset();
     gpsSeen = true; lastGpsMillis = millis();
     applyGpsReference();
   }
@@ -273,7 +300,7 @@ void pollFallback() {
     StateGuard guard;
     int size = upstream.parsePacket();
     if (size) {
-      uint32_t receivedMicros = micros();
+      uint32_t receivedMicros = clockMicros();
       uint8_t packet[48] = {};
       int count = upstream.read(packet, sizeof(packet));
       while (upstream.available()) upstream.read();
@@ -289,7 +316,7 @@ void pollFallback() {
             int64_t difference = int64_t(sample.seconds) * 1000000 + sample.fractionUs - ppsNow;
             if (sample.uncertaintyUs < 100000 && (difference < -500000 || difference > 500000)) {
               ppsBlocked = true; ppsBlockedAt = millis();
-              ppsClock.reset(); gpsCalibration.reset(); applyGpsReference();
+              ppsClock.reset(); frequencyDiscipline.reset(); gpsCalibration.reset(); applyGpsReference();
               fallbackState = "PPS-Sekundenzuordnung widerspricht NTP";
             } else fallbackState = "PPS aktiv; NTP-Plausibilitaetsvergleich";
           } else if (uint32_t(millis() - lastGpsMillis) < 1500) {
@@ -316,7 +343,7 @@ void pollFallback() {
         upstreamPending = false;
       } else fallbackState = "ungueltige Antwort";
     }
-    if (upstreamPending && uint32_t(micros() - upstreamSentMicros) > 1500000) {
+    if (upstreamPending && uint32_t(clockMicros() - upstreamSentMicros) > 1500000) {
       upstreamPending = false; fallbackState = "keine gueltige Antwort (Timeout)";
     }
     return;
@@ -343,16 +370,24 @@ void pollFallback() {
   uint8_t packet[48] = {}; packet[0] = 0x23;
   put32(upstreamNonce, randomWord()); put32(upstreamNonce + 4, randomWord());
   memcpy(packet + 40, upstreamNonce, 8);
-  upstreamSentMicros = micros();
+  upstreamSentMicros = clockMicros();
   if (!upstream.beginPacket(upstreamAddress, 123) || upstream.write(packet, sizeof(packet)) != sizeof(packet) || !upstream.endPacket()) {
     fallbackState = "Senden fehlgeschlagen"; return;
   }
   upstreamPending = true; fallbackState = "warte auf Antwort";
 }
 void serveNtp() {
+#ifndef ESP32
+  uint32_t pollStarted = clockMicros();
+#endif
   int size = ntp.parsePacket();
   if (!size) return;
-  uint8_t receiveTime[8]; timestamp(receiveTime);
+#ifdef ESP32
+  uint32_t receivedAt = ntp.receivedAt();
+#else
+  uint32_t receivedAt = pollStarted + uint32_t(clockMicros() - pollStarted) / 2;
+#endif
+  uint8_t receiveTime[8]; timestamp(receiveTime, receivedAt);
   uint8_t packet[48] = {};
   int count = ntp.read(packet, sizeof(packet));
   while (ntp.available()) ntp.read();
@@ -370,9 +405,13 @@ void serveNtp() {
   if (clockValid) put32(reply + 16, referenceSeconds + NTP_EPOCH);
   memcpy(reply + 24, packet + 40, 8);
   memcpy(reply + 32, receiveTime, 8);
-  timestamp(reply + 40);
-  ntp.beginPacket(ntp.remoteIP(), ntp.remotePort());
-  ntp.write(reply, sizeof(reply)); ntp.endPacket(); ++requests;
+  if (!ntp.beginPacket(ntp.remoteIP(), ntp.remotePort())) return;
+#ifdef ESP32
+  ntp.setMapping(clockMapping(clockMicros())); // Transmit timestamp is set in the lwIP send callback.
+#else
+  timestamp(reply + 40, clockMicros());
+#endif
+  if (ntp.write(reply, sizeof(reply)) == sizeof(reply) && ntp.endPacket()) ++requests;
 }
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GPS NTP</title>
@@ -386,7 +425,7 @@ const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset=
 <section><h2>WLAN zurücksetzen</h2><p>Löscht die gespeicherten WLAN-Zugangsdaten und startet das Gerät neu. Danach ist die Einrichtung wieder über den Access Point möglich. Der Notfall-NTP bleibt gespeichert.</p><button id="reset" style="background:#ffb1a8">WLAN löschen und neu starten</button><p id="resetMessage" role="status"></p></section>
 <script>
 const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['calibration','GPS-Kalibrierung'],['gpsOffset','GPS-Korrektur durch NTP'],['ntpDelay','NTP-Netzlaufzeit'],['calibrationSpread','Streuung der Vergleiche'],['wireCorrection','UART-Zeitkorrektur'],['timingRejected','Verzögerte GPS-Sätze verworfen'],['gpsOverflows','GPS-Pufferüberläufe'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','LAN-/WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
-fields.splice(3,0,['pps','PPS (optional)'],['board','Board'],['interface','Netzwerkschnittstelle'],['ipMode','IP-Konfiguration']);
+fields.splice(3,0,['pps','PPS (optional)'],['capture','PPS-Zeiterfassung'],['frequency','Frequenzkorrektur'],['frequencyJitter','PPS-Intervallstreuung'],['ntpTimestamps','NTP-Zeitstempel'],['ntpDrops','NTP verworfen / Sendefehler'],['board','Board'],['interface','Netzwerkschnittstelle'],['ipMode','IP-Konfiguration']);
 let configLoaded=false,resetting=false,updating=false;
 const svgNS='http://www.w3.org/2000/svg';
 function skyNode(tag,attrs,text){let el=document.createElementNS(svgNS,tag);for(let[k,v]of Object.entries(attrs))el.setAttribute(k,v);if(text!==undefined)el.textContent=text;document.querySelector('#sky').append(el);return el}
@@ -531,7 +570,8 @@ void status() {
   StateGuard guard;
   String utc = "—";
   if (synchronized()) {
-    time_t now = referenceSeconds + uint32_t(micros() - referenceMicros) / 1000000;
+    uint32_t mono = clockMicros();
+    time_t now = clockMapping(mono).unixMicrosAt(mono) / 1000000;
     struct tm calendar; gmtime_r(&now, &calendar);
     char buffer[32]; strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &calendar); utc = buffer;
   }
@@ -539,7 +579,17 @@ void status() {
   auto field = [&json](const char *key, const String &value) { json += ",\"" + String(key) + "\":\"" + value + "\""; };
   field("utc", utc);
   field("source", synchronized() ? (ppsTime ? "GPS + PPS" : networkTime ? "Notfall-NTP" : gpsCalibrated ? "GPS + NTP-Kalibrierung" : "GPS (NMEA)") : "keine");
-  field("pps", ppsBlocked ? "UTC-Zuordnung widerspricht NTP; 60 s gesperrt" : ppsTime ? "synchronisiert" : ppsClock.detected(micros()) ? "Impulse erkannt; warte auf stabile UTC-Zuordnung" : "kein PPS erkannt (optional; Pins siehe README)");
+  field("pps", ppsBlocked ? "UTC-Zuordnung widerspricht NTP; 60 s gesperrt" : ppsTime ? "synchronisiert" : ppsClock.detected(clockMicros()) ? "Impulse erkannt; warte auf stabile UTC-Zuordnung" : "kein PPS erkannt (optional; Pins siehe README)");
+  field("capture", hardwareCapture ? "MCPWM-Hardware (WT32)" : "GPIO-Interrupt / micros");
+  field("frequency", ppsTime && frequencyDiscipline.ready(clockMicros()) ? String(frequencyDiscipline.ratePpb / 1000.0, 3) + " ppm (lokaler Gangfehler)" : "lernt (" + String(frequencyDiscipline.progress()) + "/16 Intervalle)");
+  field("frequencyJitter", frequencyDiscipline.ready(clockMicros()) ? String(frequencyDiscipline.jitterUs) + " us" : "—");
+#ifdef ESP32
+  field("ntpTimestamps", "Empfang/Sendeuebergabe im lwIP-Stack (Software)");
+  field("ntpDrops", String(ntp.dropped()));
+#else
+  field("ntpTimestamps", "UDP-Abholung / Software");
+  field("ntpDrops", "—");
+#endif
   field("stratum", synchronized() ? String(clockStratum) : "16 (unsynchronisiert)");
   field("fallbackHost", fallbackHost.length() ? fallbackHost : "deaktiviert");
   field("fallbackState", !fallbackHost.length() ? "deaktiviert" :
@@ -588,7 +638,14 @@ void setup() {
 #endif
 #if GPS_PPS_ENABLED
   pinMode(GPS_PPS_PIN, INPUT_PULLUP);
+#ifdef ESP32
+  if (!beginPrecisionCapture(GPS_PPS_PIN, onCapturedPps)) {
+    Serial.println("[GPS] Hardware-Capture fehlgeschlagen; GPIO-Interrupt als Rueckfall.");
+    attachInterrupt(digitalPinToInterrupt(GPS_PPS_PIN), onPps, RISING);
+  } else Serial.println("[GPS] MCPWM-Hardware-Capture aktiv (80 MHz).");
+#else
   attachInterrupt(digitalPinToInterrupt(GPS_PPS_PIN), onPps, RISING);
+#endif
   Serial.printf("[GPS] PPS GPIO%d; GPS-TX an GPIO%d.\n", GPS_PPS_PIN, GPS_RX_PIN);
 #endif
   loadFallback();
@@ -768,7 +825,7 @@ void setup() {
 void timingStep() {
   StateGuard guard;
   capturePps();
-  if (ppsTime && !ppsClock.locked(micros())) applyGpsReference();
+  if (ppsTime && !ppsClock.locked(clockMicros())) { frequencyDiscipline.reset(); applyGpsReference(); }
   readGps();
   if (!networkTime && gpsCalibrated && !gpsCalibration.ready(millis())) applyGpsReference();
   serveNtp();
