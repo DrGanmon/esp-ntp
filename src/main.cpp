@@ -14,6 +14,26 @@
 #include "nmea_timing.h"
 #include "gps_calibration.h"
 #include "satellite_view.h"
+#include "pps_clock.h"
+#ifndef GPS_PPS_ENABLED
+#define GPS_PPS_ENABLED 1
+#endif
+PpsClock ppsClock;
+bool ppsTime = false;
+bool ppsBlocked = false;
+uint32_t ppsBlockedAt = 0;
+#if GPS_PPS_ENABLED
+volatile uint32_t ppsEdgeMicros = 0, ppsSequence = 0;
+void IRAM_ATTR onPps() { ppsEdgeMicros = micros(); ++ppsSequence; }
+#endif
+void capturePps() {
+#if GPS_PPS_ENABLED
+  noInterrupts();
+  uint32_t edge = ppsEdgeMicros, sequence = ppsSequence;
+  interrupts();
+  if (sequence) ppsClock.pulse(edge, sequence);
+#endif
+}
 
 // GPS TX -> D5. RX is not needed. All GPIO signals must be 3.3 V.
 SoftwareSerial gpsSerial(D5, -1);
@@ -78,6 +98,13 @@ uint32_t uncertaintyUs() {
 }
 bool gpsFresh() { return gpsSeen && uint32_t(millis() - lastGpsMillis) < 5000; }
 void applyGpsReference() {
+  ppsTime = ppsClock.locked(micros());
+  if (ppsTime) {
+    referenceSeconds = ppsClock.referenceSeconds; referenceMicros = ppsClock.referenceMicros;
+    lastSyncMillis = lastGpsMillis; clockValid = true; networkTime = false; gpsCalibrated = false;
+    baseUncertaintyUs = 2000; clockStratum = 1; clockLeap = 0;
+    return;
+  }
   gpsCalibrated = gpsCalibration.ready(millis());
   GpsCalibration::correctedAnchor(rawGpsSeconds, rawGpsMicros,
                                   gpsCalibrated ? gpsCalibration.offsetUs : 0,
@@ -169,6 +196,10 @@ void readGps() {
       if (!gpsFresh() || phaseError < -20000 || phaseError > 20000) gpsCalibration.reset();
     }
     rawGpsSeconds = epoch; rawGpsMicros = anchor;
+    capturePps();
+    if (ppsBlocked && uint32_t(millis() - ppsBlockedAt) >= 60000) ppsBlocked = false;
+    if (!ppsBlocked) ppsClock.associate(epoch, receivedAt - gpsWireCorrectionUs, gps.time.centisecond());
+    else ppsClock.reset();
     gpsSeen = true; lastGpsMillis = millis();
     applyGpsReference();
   }
@@ -193,7 +224,15 @@ void pollFallback() {
         lastNtpDelayUs = sample.delayUs;
         ntpMeasured = true;
         if (gpsFresh()) {
-          if (uint32_t(millis() - lastGpsMillis) < 1500) {
+          if (ppsTime) {
+            int64_t ppsNow = int64_t(referenceSeconds) * 1000000 + uint32_t(receivedMicros - referenceMicros);
+            int64_t difference = int64_t(sample.seconds) * 1000000 + sample.fractionUs - ppsNow;
+            if (sample.uncertaintyUs < 100000 && (difference < -500000 || difference > 500000)) {
+              ppsBlocked = true; ppsBlockedAt = millis();
+              ppsClock.reset(); gpsCalibration.reset(); applyGpsReference();
+              fallbackState = "PPS-Sekundenzuordnung widerspricht NTP";
+            } else fallbackState = "PPS aktiv; NTP-Plausibilitaetsvergleich";
+          } else if (uint32_t(millis() - lastGpsMillis) < 1500) {
             int64_t rawTime = int64_t(rawGpsSeconds) * 1000000 + uint32_t(receivedMicros - rawGpsMicros);
             int64_t ntpTime = int64_t(sample.seconds) * 1000000 + sample.fractionUs;
             if (gpsCalibration.add(ntpTime - rawTime, sample.delayUs, sample.uncertaintyUs,
@@ -207,7 +246,7 @@ void pollFallback() {
         } else {
           referenceSeconds = sample.seconds;
           referenceMicros = receivedMicros - sample.fractionUs;
-          lastSyncMillis = millis(); clockValid = true; networkTime = true; gpsCalibrated = false;
+          lastSyncMillis = millis(); clockValid = true; networkTime = true; gpsCalibrated = false; ppsTime = false;
           baseUncertaintyUs = sample.uncertaintyUs;
           clockStratum = sample.stratum; clockLeap = sample.leap;
           referenceAddress = upstreamAddress;
@@ -262,7 +301,7 @@ void serveNtp() {
   reply[0] = (valid ? (clockLeap << 6) : 0xC0) | (version << 3) | 4;
   reply[1] = valid ? clockStratum : 16;
   reply[2] = 6;
-  reply[3] = networkTime || gpsCalibrated ? uint8_t(-10) : 0;
+  reply[3] = ppsTime ? uint8_t(-16) : networkTime || gpsCalibrated ? uint8_t(-10) : 0;
   put32(reply + 8, valid ? (uint64_t(uncertaintyUs()) * 65536 / 1000000) : 0xFFFF0000UL);
   if (networkTime || gpsCalibrated) for (unsigned i = 0; i < 4; ++i) reply[12 + i] = referenceAddress[i];
   else memcpy(reply + 12, "GPS", 3);
@@ -285,6 +324,7 @@ const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset=
 <section><h2>WLAN zurücksetzen</h2><p>Löscht die gespeicherten WLAN-Zugangsdaten und startet das Gerät neu. Danach ist die Einrichtung wieder über den Access Point möglich. Der Notfall-NTP bleibt gespeichert.</p><button id="reset" style="background:#ffb1a8">WLAN löschen und neu starten</button><p id="resetMessage" role="status"></p></section>
 <script>
 const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['calibration','GPS-Kalibrierung'],['gpsOffset','GPS-Korrektur durch NTP'],['ntpDelay','NTP-Netzlaufzeit'],['calibrationSpread','Streuung der Vergleiche'],['wireCorrection','UART-Zeitkorrektur'],['timingRejected','Verzögerte GPS-Sätze verworfen'],['gpsOverflows','GPS-Pufferüberläufe'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
+fields.splice(3,0,['pps','PPS (optional)']);
 let configLoaded=false,resetting=false,updating=false;
 const svgNS='http://www.w3.org/2000/svg';
 function skyNode(tag,attrs,text){let el=document.createElementNS(svgNS,tag);for(let[k,v]of Object.entries(attrs))el.setAttribute(k,v);if(text!==undefined)el.textContent=text;document.querySelector('#sky').append(el);return el}
@@ -436,7 +476,8 @@ void status() {
   String json = "{\"synced\":" + String(synchronized() ? "true" : "false");
   auto field = [&json](const char *key, const String &value) { json += ",\"" + String(key) + "\":\"" + value + "\""; };
   field("utc", utc);
-  field("source", synchronized() ? (networkTime ? "Notfall-NTP" : gpsCalibrated ? "GPS + NTP-Kalibrierung" : "GPS (NMEA)") : "keine");
+  field("source", synchronized() ? (ppsTime ? "GPS + PPS" : networkTime ? "Notfall-NTP" : gpsCalibrated ? "GPS + NTP-Kalibrierung" : "GPS (NMEA)") : "keine");
+  field("pps", ppsBlocked ? "UTC-Zuordnung widerspricht NTP; 60 s gesperrt" : ppsTime ? "synchronisiert" : ppsClock.detected(micros()) ? "Impulse erkannt; warte auf stabile UTC-Zuordnung" : "kein PPS erkannt (optional D6/GPIO12)");
   field("stratum", synchronized() ? String(clockStratum) : "16 (unsynchronisiert)");
   field("fallbackHost", fallbackHost.length() ? fallbackHost : "deaktiviert");
   field("fallbackState", !fallbackHost.length() ? "deaktiviert" :
@@ -444,7 +485,7 @@ void status() {
   field("satellites", gps.satellites.isValid() && gps.satellites.age() < 5000 ? String(gps.satellites.value()) : "—");
   field("visible", satelliteView.fresh(millis()) ? String(satelliteView.count()) : "—");
   field("hdop", gps.hdop.isValid() && gps.hdop.age() < 5000 ? String(gps.hdop.hdop(), 1) : "—");
-  field("uncertainty", synchronized() ? String(uncertaintyUs() / 1000.0, 2) + (networkTime || gpsCalibrated ? " ms (NTP-Schaetzung)" : " ms (ohne PPS)") : "unbekannt");
+  field("uncertainty", synchronized() ? String(uncertaintyUs() / 1000.0, 2) + (ppsTime ? " ms (PPS-Annahme, ungemessen)" : networkTime || gpsCalibrated ? " ms (NTP-Schaetzung)" : " ms (ohne PPS)") : "unbekannt");
   field("calibration", gpsCalibration.ready(millis()) ? "bereit" : "nicht bereit (" + String(gpsCalibration.sampleCount()) + "/5 Messungen)");
   field("gpsOffset", gpsCalibrated ? String(gpsCalibration.offsetUs / 1000.0, 2) + " ms" : "—");
   field("ntpDelay", ntpMeasured ? String(lastNtpDelayUs / 1000.0, 2) + " ms" : "—");
@@ -465,6 +506,11 @@ void setup() {
   Serial.println("\n[BOOT] GPS-NTP startet");
   Serial.printf("[BOOT] Reset-Ursache: %s\n", ESP.getResetReason().c_str());
   gpsSerial.begin(9600, SWSERIAL_8N1, D5, -1, false, 128, 1024);
+#if GPS_PPS_ENABLED
+  pinMode(D6, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(D6), onPps, RISING);
+  Serial.println("[GPS] Optionaler PPS-Eingang: D6 / GPIO12.");
+#endif
   loadFallback();
   loadOtaPassword();
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.hostname("gps-ntp");
@@ -583,6 +629,8 @@ void loop() {
     WiFi.persistent(true); WiFi.disconnect(true); WiFi.persistent(false);
     ESP.restart(); return;
   }
+  capturePps();
+  if (ppsTime && !ppsClock.locked(micros())) applyGpsReference();
   readGps();
   if (!networkTime && gpsCalibrated && !gpsCalibration.ready(millis())) applyGpsReference();
   serveNtp();

@@ -10,7 +10,7 @@ ESP8266-Firmware für einen lokalen NTP-Server (UDP 123), der UTC vom u-blox NEO
 | GND | GND |
 | VCC | gemäß der Versorgungsspezifikation des konkreten GPS-Breakouts |
 | RX | nicht benötigt |
-| PPS / TIMEPULSE | in dieser Version nicht verwendet |
+| PPS / TIMEPULSE | optional D6 / GPIO12 (3,3-V-Signal) |
 
 GPIO am ESP8266 vertragen nur 3,3 V. Das nackte NEO-6M-Modul benötigt 2,7–3,6 V; manche Breakout-Platinen haben einen Regler und erlauben eine andere Eingangsspannung. Vor Anschluss die eigene Platine prüfen. Gemeinsame Masse verwenden. GPS-Antenne mit freier Sicht zum Himmel platzieren. UART-Vorgabe: 9600 Baud, 8N1, NMEA RMC/GGA/GSV aktiviert. Bereits umkonfigurierte Module gegebenenfalls zurücksetzen.
 
@@ -37,6 +37,16 @@ Bei WLAN-Ausfall wird das Portal erneut geöffnet. Über **WLAN löschen und neu
 `Leaving... Hard resetting via RTS pin...` ist die Ausgabe des Upload-Werkzeugs. Der danach geöffnete Monitor allein bestätigt noch keinen erfolgreichen Firmware-Start. Die Firmware schreibt beim Start `[BOOT]`-Meldungen, beim AP-Start dessen Namen und alle zehn Sekunden eine `[STATUS]`-Zeile. DTR/RTS sind für den Monitor deaktiviert, damit dessen Steuerleitungen das Board nicht im Reset halten.
 
 Nach dem Upload den Monitor mit 115200 Baud öffnen und einmal die Reset-Taste am D1 mini drücken. Nach spätestens 20 Sekunden sollte der AP sichtbar sein, wenn keine WLAN-Verbindung besteht. Falls der ESP bereits verbunden ist, zeigt das Terminal stattdessen die WLAN-IP. Ohne GPS-Modul muss die WLAN-Einrichtung ebenfalls funktionieren. Bleibt der Monitor völlig leer, Port und USB-Verbindung prüfen und testweise das GPS-Modul bei ausgeschalteter Versorgung abziehen. Das Einrichtungs-WLAN nutzt 2,4 GHz; die Setup-Adresse lautet `http://192.168.4.1/`.
+
+## Optionales PPS-Signal
+
+Der NEO-6M besitzt an Modul-Pin 3 den Ausgang TIMEPULSE. Falls dieser an deiner Trägerplatine zugänglich ist, zusätzlich mit **D6 / GPIO12** verbinden. TX bleibt an D5, die Masse muss gemeinsam sein. Nur ein 3,3-V-kompatibles Signal verwenden. Ohne PPS-Leitung bleibt D6 frei und die bisherige NMEA-/NTP-Zeitübernahme funktioniert weiter. Die optionale Erkennung ist standardmäßig aktiv; mit `-D GPS_PPS_ENABLED=0` in den PlatformIO-Build-Flags lässt sie sich vollständig abschalten.
+
+Vorausgesetzt wird die Werkskonfiguration: **1 Hz, steigende Flanke auf der UTC-Sekundengrenze, nachfolgender RMC-Satz für dieselbe Sekunde**. Anders konfigurierte Frequenz, Polarität oder eine um ganze Sekunden verschobene Ausgabe müssen zuerst korrigiert werden. Die Firmware ordnet einen zeitnah verarbeiteten ganzsekündigen RMC-Satz dem vorausgehenden Puls zu. Der Satzanfang muss 10–800 ms nach dem Puls liegen. Drei aufeinanderfolgende Zuordnungen, Pulsabstände von 1 s ±2 ms und eine stabile RMC-Verzögerung innerhalb 20 ms sind für die Aktivierung nötig. Regelmäßige Pulse allein beweisen keine richtige UTC-Zuordnung.
+
+Die Statusseite zeigt **PPS (optional)** und bei erfolgreicher Zuordnung **GPS + PPS** als Zeitquelle. PPS hat Vorrang vor der NTP-Kalibrierung; die serielle Übertragungsverzögerung geht dann nicht in den Zeitanker ein. NTP dient weiterhin als Plausibilitätskontrolle. Widerspricht eine ausreichend genaue NTP-Antwort der PPS-Zeit um mehr als 0,5 s, wird die Zuordnung verworfen und PPS für 60 Sekunden gesperrt. Ohne unabhängige Referenz kann eine ganze Sekunde falsche Zuordnung nicht sicher ausgeschlossen werden.
+
+Fehlen passende RMC-Sätze, fallen Pulse aus oder wird die Impulsfolge unplausibel, erfolgt automatisch der Rückfall auf NMEA mit gegebenenfalls vorhandener NTP-Kalibrierung bzw. bei GPS-Ausfall auf Notfall-NTP. Spätestens 1,5 Sekunden nach dem letzten zugeordneten Puls wird PPS nicht mehr als aktive Zeitquelle verwendet. Es werden keine Sekunden allein aus unbestätigten Pulsen fortgeschrieben. Für PPS werden vorläufig **2 ms plus 100 ppm seit der letzten Übernahme** als technische Unsicherheit angesetzt. Das ist keine gemessene Genauigkeit; WLAN- und Interruptlatenz bleiben zu prüfen. Die Firmware stellt die PPS-Konfiguration des GPS-Moduls nicht selbst um.
 
 ## Position und Satellitenhimmel
 
@@ -82,7 +92,7 @@ Ein abgebrochener oder abgelehnter Upload löst keinen Neustart aus. Bei einem V
 
 ## Zeitqualität und Grenzen
 
-Für GPS verwendet diese Version **serielle NMEA-Zeit ohne PPS**. Die Firmware kompensiert die berechenbare Übertragungszeit des gültigen RMC-Satzes: bei 9600 Baud und 8N1 dauert jedes Zeichen ungefähr 1,042 ms. Der Zeitanker wird um die Übertragungsdauer vom `$` bis zum abschließenden `CR` zurückgerechnet. Die tatsächliche Korrektur steht auf der Statusseite unter **UART-Zeitkorrektur**.
+Ohne angeschlossenes und zugeordnetes PPS verwendet diese Version **serielle NMEA-Zeit**. Die Firmware kompensiert die berechenbare Übertragungszeit des gültigen RMC-Satzes: bei 9600 Baud und 8N1 dauert jedes Zeichen ungefähr 1,042 ms. Der Zeitanker wird um die Übertragungsdauer vom `$` bis zum abschließenden `CR` zurückgerechnet. Die tatsächliche Korrektur steht auf der Statusseite unter **UART-Zeitkorrektur**. Bei GPS + PPS bestimmt stattdessen die Impulsflanke den Zeitanker.
 
 Nur zeitnah verarbeitete RMC-Sätze werden als Zeitreferenz übernommen. Pausen von mehr als 10 ms in der GPS-Verarbeitung, Pufferüberläufe oder eine um mehr als 8 ms von der erwarteten Übertragungsdauer abweichende Satzaufnahme verwerfen den Satz für die Zeitübernahme. Satelliten- und Positionsdaten werden weiterhin ausgewertet. Die Statusseite zählt verworfene Sätze und Pufferüberläufe. Bei langen HTTP-/OTA-Vorgängen kann dieser Zähler steigen; mit dem nächsten rechtzeitig empfangenen RMC-Satz setzt die Zeitübernahme wieder ein.
 
@@ -92,7 +102,7 @@ Ohne aktive NTP-Kalibrierung bleiben die interne Verzögerung des GPS-Moduls und
 
 Die Firmware übernimmt GPS-Zeit nur mit aktueller gültiger GPS-Position und aktuellem Datum/Zeit. Nach 60 Sekunden ohne gültige Übernahme von GPS oder Notfall-NTP antwortet NTP mit Leap Indicator 3 und Stratum 16 (unsynchronisiert). Bei GPS-Zeit ohne NTP-Kalibrierung meldet der direkt GPS-gebundene Server Stratum 1; das bedeutet hier keine Mikrosekundengenauigkeit. Kalibrierte GPS-Zeit übernimmt die NTP-Abhängigkeit wie oben beschrieben. UTC wird unverändert ausgegeben, Zeitzone und Sommerzeit sind Aufgabe der Clients.
 
-Für verlässlich höhere GPS-Genauigkeit unabhängig von NTP ist ein zugängliches TIMEPULSE/PPS-Signal mit eindeutiger Zuordnung von UTC-Sekunde zu Puls sowie eine entsprechend erweiterte Firmware nötig. Bei Platinen mit ausschließlich TX/RX/VCC/GND steht diese Option ohne Hardwareänderung nicht zur Verfügung. Die Zeitimpuls-Spezifikation des GPS-Chips ist nicht die erreichbare Genauigkeit eines WLAN-NTP-Clients. Bei alten GPS-Empfängern mögliche Datumsprobleme durch Firmware/GPS-Wochen-Rollover mit einer unabhängigen Referenz prüfen.
+Für höhere GPS-Genauigkeit unabhängig von der seriellen Ausgabeverzögerung unterstützt die Firmware optional TIMEPULSE/PPS wie oben beschrieben. Bei Platinen mit ausschließlich TX/RX/VCC/GND ist dafür eine zusätzliche Verbindung zum Modul nötig. Die Zeitimpuls-Spezifikation des GPS-Chips ist nicht die erreichbare Genauigkeit eines WLAN-NTP-Clients. Bei alten GPS-Empfängern mögliche Datumsprobleme durch Firmware/GPS-Wochen-Rollover mit einer unabhängigen Referenz prüfen.
 
 ## Prüfung mit Hardware
 
@@ -101,6 +111,7 @@ Für verlässlich höhere GPS-Genauigkeit unabhängig von NTP ist ein zugänglic
 - Während der 60 Sekunden nach erfolgreicher WLAN-Anmeldung über den AP `/`, `/dashboard` und eine Captive-Portal-Prüfadresse öffnen: alle müssen weiterhin das Setup zeigen bzw. dorthin umleiten. Gleichzeitig muss über die WLAN-IP die normale Statusoberfläche erreichbar sein.
 - Falsches Passwort und WLAN-Ausfall: Portal bleibt bzw. wird erneut erreichbar.
 - Unter freiem Himmel Satelliten und plausibles UTC-Datum prüfen.
+- Optional PPS mit D6 verbinden: nach drei stabilen Zuordnungen muss GPS + PPS erscheinen. PPS abziehen oder GPS-TX trennen: automatische Rückkehr zur bisherigen Zeitquelle prüfen. Korrekte UTC-Sekunde gegen eine unabhängige Referenz kontrollieren, insbesondere nach Änderungen der GPS-Konfiguration.
 - Position und Höhe gegen einen bekannten Standort vergleichen. Im Satellitenhimmel müssen 0° Azimut oben und 90° rechts liegen; Satelliten bei 90° Elevation erscheinen in der Mitte. GPS-TX trennen: Position muss nach fünf Sekunden verschwinden, die Himmelsansicht nach zehn Sekunden.
 - Mit einem NTP-Client Synchronisationsstatus und Abweichung gegen eine unabhängige Quelle messen.
 - Bei laufendem GPS einen genauen NTP-Server eintragen: nach mindestens drei stabilen Vergleichen muss die Quelle auf GPS + NTP-Kalibrierung wechseln. Korrektur, Laufzeit, Streuung und NTP-Stratum prüfen. Den NTP-Server anschließend unerreichbar machen: spätestens nach Ablauf der Vergleichswerte muss die konservative GPS-Unsicherheit zurückkehren. Serverfeld leeren: Kalibrierung muss sofort verschwinden.
@@ -123,6 +134,8 @@ g++ -std=c++11 -Wall -Wextra -Iinclude tests/gps_calibration_test.cpp -o /tmp/es
 /tmp/esp-ntp-calibration-test
 g++ -std=c++11 -Wall -Wextra -Iinclude tests/satellite_view_test.cpp -o /tmp/esp-ntp-satellite-test
 /tmp/esp-ntp-satellite-test
+g++ -std=c++11 -Wall -Wextra -Iinclude tests/pps_clock_test.cpp -o /tmp/esp-ntp-pps-test
+/tmp/esp-ntp-pps-test
 ```
 
 Grundlagen: [u-blox NEO-6 Datenblatt](https://content.u-blox.com/sites/default/files/products/documents/NEO-6_DataSheet_%28GPS.G6-HW-09005%29.pdf), [TinyGPSPlus](https://github.com/mikalhart/TinyGPSPlus), [ESP8266 Arduino Core](https://github.com/esp8266/Arduino).
