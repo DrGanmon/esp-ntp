@@ -1,20 +1,18 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
+#include "board_support.h"
 #include <DNSServer.h>
 #include <WiFiUdp.h>
-#include <SoftwareSerial.h>
 #include <TinyGPSPlus.h>
 #include <time.h>
 #include <EEPROM.h>
-#include <Updater.h>
 #include <memory>
 #include "ntp_fallback.h"
 #include "nmea_timing.h"
 #include "gps_calibration.h"
 #include "satellite_view.h"
 #include "pps_clock.h"
+#include "ip_config.h"
+#include "network_page.h"
 #ifndef GPS_PPS_ENABLED
 #define GPS_PPS_ENABLED 1
 #endif
@@ -24,19 +22,39 @@ bool ppsBlocked = false;
 uint32_t ppsBlockedAt = 0;
 #if GPS_PPS_ENABLED
 volatile uint32_t ppsEdgeMicros = 0, ppsSequence = 0;
-void IRAM_ATTR onPps() { ppsEdgeMicros = micros(); ++ppsSequence; }
+void IRAM_ATTR onPps() {
+#ifdef ESP32
+  portENTER_CRITICAL_ISR(&ppsMux);
+#endif
+  ppsEdgeMicros = micros(); ++ppsSequence;
+#ifdef ESP32
+  portEXIT_CRITICAL_ISR(&ppsMux);
+#endif
+}
 #endif
 void capturePps() {
 #if GPS_PPS_ENABLED
+#ifdef ESP32
+  portENTER_CRITICAL(&ppsMux);
+#else
   noInterrupts();
+#endif
   uint32_t edge = ppsEdgeMicros, sequence = ppsSequence;
+#ifdef ESP32
+  portEXIT_CRITICAL(&ppsMux);
+#else
   interrupts();
+#endif
   if (sequence) ppsClock.pulse(edge, sequence);
 #endif
 }
 
-// GPS TX -> D5. RX is not needed. All GPIO signals must be 3.3 V.
-SoftwareSerial gpsSerial(D5, -1);
+// GPS TX -> board-specific RX pin. All GPIO signals must be 3.3 V.
+#ifdef ESP32
+HardwareSerial gpsSerial(2);
+#else
+SoftwareSerial gpsSerial(GPS_RX_PIN, -1);
+#endif
 TinyGPSPlus gps;
 SatelliteView satelliteView;
 NmeaTiming gpsTiming;
@@ -46,7 +64,7 @@ uint32_t rawGpsSeconds = 0, rawGpsMicros = 0, lastNtpDelayUs = 0;
 bool gpsCalibrated = false, ntpMeasured = false;
 IPAddress calibrationAddress;
 uint8_t calibrationLeap = 0;
-ESP8266WebServer web(80);
+DeviceWebServer web(80);
 DNSServer dns;
 WiFiUDP ntp;
 WiFiUDP upstream;
@@ -64,7 +82,7 @@ uint32_t resetAt = 0;
 bool resetPending = false;
 String otaPassword, otaError;
 constexpr char DEFAULT_OTA_PASSWORD[] = "gpsntp-update";
-std::unique_ptr<UpdaterClass> otaWriter;
+std::unique_ptr<FirmwareUpdater> otaWriter;
 unsigned otaFiles = 0;
 bool otaEnded = false, otaRestartPending = false;
 uint32_t otaLastActivity = 0, otaRestartAt = 0;
@@ -80,6 +98,43 @@ uint32_t requests = 0;
 bool clockValid = false;
 constexpr uint32_t MAX_AGE_MS = 60000;
 constexpr uint32_t NTP_EPOCH = 2208988800UL;
+bool useDhcp = true, networkRestartPending = false;
+uint32_t networkRestartAt = 0;
+IPAddress staticIp, staticGateway, staticMask, staticDns;
+void networkLoop();
+#ifdef ESP32
+void timingTask(void *);
+void webTask(void *);
+#endif
+uint32_t ipNumber(const IPAddress &ip) {
+  return (uint32_t(ip[0]) << 24) | (uint32_t(ip[1]) << 16) | (uint32_t(ip[2]) << 8) | ip[3];
+}
+void loadNetworkConfig() {
+  if (EEPROM.read(144) != 0xC3) return;
+  uint8_t checksum = 0;
+  for (unsigned i = 145; i < 162; ++i) checksum ^= EEPROM.read(i);
+  if (checksum != EEPROM.read(162)) return;
+  if (EEPROM.read(145) != 1) return;
+  IPAddress *addresses[] = {&staticIp, &staticGateway, &staticMask, &staticDns};
+  for (unsigned i = 0; i < 4; ++i)
+    for (unsigned j = 0; j < 4; ++j) (*addresses[i])[j] = EEPROM.read(146 + i * 4 + j);
+  useDhcp = !IpConfig::valid(ipNumber(staticIp), ipNumber(staticGateway), ipNumber(staticMask), ipNumber(staticDns));
+}
+bool saveNetworkConfig(bool dhcp, const IPAddress &ip, const IPAddress &gateway,
+                       const IPAddress &mask, const IPAddress &resolver) {
+  uint8_t previous[19];
+  for (unsigned i = 0; i < sizeof(previous); ++i) previous[i] = EEPROM.read(144 + i);
+  EEPROM.write(144, 0xC3); EEPROM.write(145, dhcp ? 0 : 1);
+  const IPAddress addresses[] = {ip, gateway, mask, resolver};
+  for (unsigned i = 0; i < 4; ++i)
+    for (unsigned j = 0; j < 4; ++j) EEPROM.write(146 + i * 4 + j, addresses[i][j]);
+  uint8_t checksum = 0;
+  for (unsigned i = 145; i < 162; ++i) checksum ^= EEPROM.read(i);
+  EEPROM.write(162, checksum);
+  if (EEPROM.commit()) return true;
+  for (unsigned i = 0; i < sizeof(previous); ++i) EEPROM.write(144 + i, previous[i]);
+  return false;
+}
 
 // Gregorian UTC calendar -> Unix seconds, independent of local timezone.
 uint32_t unixSeconds(int year, unsigned month, unsigned day, unsigned h, unsigned m, unsigned s) {
@@ -122,7 +177,7 @@ bool saveFallback(const String &host) {
   return EEPROM.commit();
 }
 void loadFallback() {
-  EEPROM.begin(136);
+  EEPROM.begin(192);
   if (EEPROM.read(0) != 0xA7) return;
   char host[64];
   for (size_t i = 0; i < sizeof(host); ++i) host[i] = EEPROM.read(i + 1);
@@ -169,7 +224,11 @@ void timestamp(uint8_t *p) {
 void readGps() {
   // Decode the ISR buffer before checking whether it overflowed.
   gpsSerial.available();
+#ifdef ESP32
+  bool overflow = gpsRxOverflow.exchange(false);
+#else
   bool overflow = gpsSerial.overflow();
+#endif
   if (overflow) { ++gpsOverflows; satelliteView.invalidateCycle(); }
   gpsTiming.service(micros(), overflow);
   // Bound work per loop so DNS, HTTP and NTP remain responsive.
@@ -205,12 +264,13 @@ void readGps() {
   }
 }
 void pollFallback() {
-  if (!fallbackHost.length() || WiFi.status() != WL_CONNECTED) {
+  if (!fallbackHost.length() || !networkConnected()) {
     upstreamPending = false;
     upstreamAttempted = false;
     return;
   }
   if (upstreamPending) {
+    StateGuard guard;
     int size = upstream.parsePacket();
     if (size) {
       uint32_t receivedMicros = micros();
@@ -264,22 +324,24 @@ void pollFallback() {
   if (upstreamAttempted && uint32_t(millis() - upstreamLastAttempt) < 30000) return;
   upstreamAttempted = true; upstreamLastAttempt = millis();
   fallbackState = "Server wird aufgeloest";
-  // DNS resolution is limited to one second; packet reception itself is non-blocking.
-  if (!WiFi.hostByName(fallbackHost.c_str(), upstreamAddress, 1000)) {
+  // ESP8266: bounded DNS call; ESP32: asynchronous worker on the web/network core.
+  int resolved = resolveHost(fallbackHost.c_str(), upstreamAddress);
+  if (!resolved) { upstreamAttempted = false; return; }
+  if (resolved < 0) {
     fallbackState = "DNS-Aufloesung fehlgeschlagen"; return;
   }
-  if (upstreamAddress == WiFi.localIP() || upstreamAddress == WiFi.softAPIP() ||
+  if (upstreamAddress == networkIP() || upstreamAddress == WiFi.softAPIP() ||
       upstreamAddress[0] == 127 || upstreamAddress[0] == 0 || upstreamAddress[0] >= 224 ||
       upstreamAddress[3] == 255) {
     fallbackState = "ungueltige oder eigene Serveradresse"; return;
   }
   // Rebind to discard stale packets. Requests use an unpredictable originate cookie.
   upstream.stop();
-  if (!upstream.begin(uint16_t(49152 + (os_random() % 16000)))) {
+  if (!upstream.begin(uint16_t(49152 + (randomWord() % 16000)))) {
     fallbackState = "UDP-Port nicht verfuegbar"; return;
   }
   uint8_t packet[48] = {}; packet[0] = 0x23;
-  put32(upstreamNonce, os_random()); put32(upstreamNonce + 4, os_random());
+  put32(upstreamNonce, randomWord()); put32(upstreamNonce + 4, randomWord());
   memcpy(packet + 40, upstreamNonce, 8);
   upstreamSentMicros = micros();
   if (!upstream.beginPacket(upstreamAddress, 123) || upstream.write(packet, sizeof(packet)) != sizeof(packet) || !upstream.endPacket()) {
@@ -315,16 +377,16 @@ void serveNtp() {
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GPS NTP</title>
 <style>body{font:17px system-ui;background:#101b2d;color:#edf4ff;max-width:760px;margin:40px auto;padding:20px}section{background:#1c2c43;padding:24px;border-radius:16px;margin:18px 0}h1{margin-bottom:6px}dl{display:grid;grid-template-columns:1fr 1fr;gap:14px}dd{margin:0;text-align:right}input,button{font:inherit;padding:12px;box-sizing:border-box;border-radius:8px;border:0;margin:6px 0;width:100%}button{background:#72dcbd;color:#10251f;cursor:pointer}small{color:#bac8db}#message{color:#72dcbd}</style>
-<h1>GPS → NTP</h1><small>Wemos D1 mini · u-blox NEO-6M · UTC</small>
+<h1>GPS → NTP</h1><small>GPS-Zeitserver · u-blox NEO-6M · UTC</small><p><a style="color:#72dcbd" href="/network">IP-Konfiguration (DHCP / statisch)</a></p>
 <section><h2 id="state">Status wird geladen …</h2><dl id="values"></dl><small>Die Unsicherheit ist eine konservative Planungsannahme, keine gemessene Genauigkeit. Ohne PPS können NMEA-Verzögerungen die Zeit verschieben.</small></section>
 <section><h2>Position und Satellitenhimmel</h2><dl id="position"></dl><small>Koordinaten: WGS84. Nachkommastellen sind keine Genauigkeitsgarantie. Höhe über dem mittleren Meeresspiegel.</small><svg id="sky" viewBox="0 0 400 400" role="img" aria-label="Satellitenpositionen am Himmel" style="display:block;width:100%;max-width:440px;margin:auto"></svg><p id="skyState" role="status"></p><small>Norden oben, Osten rechts. Außenkreis: Horizont (0°), Mitte: Zenit (90°). Grün: Signalwert vorhanden; grau: kein Signalwert gemeldet. Die Ansicht zeigt Richtungen vom Empfänger aus, keine Satellitenentfernungen.</small><div style="overflow-x:auto"><table style="width:100%;text-align:left"><thead><tr><th>PRN</th><th>Azimut</th><th>Elevation</th><th>C/N₀</th></tr></thead><tbody id="satelliteRows"></tbody></table></div></section>
 <section><h2>Notfall-NTP und GPS-Kalibrierung</h2><form id="fallback"><label>NTP-Server (Hostname oder IPv4)<input id="fallbackHost" name="host" list="ntpServers" maxlength="63" placeholder="Leer = deaktiviert" autocomplete="off"></label><datalist id="ntpServers"><option value="pool.ntp.org"><option value="de.pool.ntp.org"></datalist><button>Notfall-NTP speichern</button></form><p id="fallbackMessage" role="status"></p><small>Der Server wird alle 30 Sekunden abgefragt: bei GPS-Empfang zur Kalibrierung, bei GPS-Ausfall als Ersatz. Ab drei stabilen Vergleichsmessungen wird die GPS-Zeit korrigiert. Ein naher, genauer NTP-Server verbessert die Voraussetzungen. Leer speichern deaktiviert auch die Kalibrierung. Millisekundengenauigkeit ist nicht garantiert.</small></section>
-<section><h2>Firmware aktualisieren</h2><form id="ota"><label>Firmware (.bin für D1 mini)<input id="firmware" type="file" accept=".bin" required></label><label>OTA-Passwort<input id="otaPassword" type="password" required autocomplete="off"></label><button>Firmware hochladen und neu starten</button></form><progress id="otaProgress" value="0" max="100" style="width:100%" hidden></progress><p id="otaMessage" role="status"></p><small>Das Standardpasswort steht in der README und kann unten geändert werden. WLAN und Notfall-NTP bleiben erhalten. Während des Updates die Stromversorgung aufrechterhalten.</small></section>
+<section><h2>Firmware aktualisieren</h2><form id="ota"><label>Firmware (.bin für dieses Board)<input id="firmware" type="file" accept=".bin" required></label><label>OTA-Passwort<input id="otaPassword" type="password" required autocomplete="off"></label><button>Firmware hochladen und neu starten</button></form><progress id="otaProgress" value="0" max="100" style="width:100%" hidden></progress><p id="otaMessage" role="status"></p><small>Das Standardpasswort steht in der README und kann unten geändert werden. WLAN und Notfall-NTP bleiben erhalten. Während des Updates die Stromversorgung aufrechterhalten.</small></section>
 <section><h2>OTA-Passwort ändern</h2><form id="changeOtaPassword"><label>Aktuelles Passwort<input id="currentOtaPassword" type="password" required autocomplete="current-password"></label><label>Neues Passwort<input name="password" id="newOtaPassword" type="password" minlength="8" maxlength="64" pattern="[!-~]{8,64}" required autocomplete="new-password"></label><label>Neues Passwort wiederholen<input name="confirmation" type="password" minlength="8" maxlength="64" required autocomplete="new-password"></label><button>OTA-Passwort speichern</button></form><p id="passwordMessage" role="status"></p><small>8–64 Zeichen: Buchstaben ohne Umlaute, Ziffern und ASCII-Sonderzeichen, keine Leerzeichen. Die Änderung gilt sofort und bleibt nach Neustart und WLAN-Reset erhalten.</small></section>
 <section><h2>WLAN zurücksetzen</h2><p>Löscht die gespeicherten WLAN-Zugangsdaten und startet das Gerät neu. Danach ist die Einrichtung wieder über den Access Point möglich. Der Notfall-NTP bleibt gespeichert.</p><button id="reset" style="background:#ffb1a8">WLAN löschen und neu starten</button><p id="resetMessage" role="status"></p></section>
 <script>
-const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['calibration','GPS-Kalibrierung'],['gpsOffset','GPS-Korrektur durch NTP'],['ntpDelay','NTP-Netzlaufzeit'],['calibrationSpread','Streuung der Vergleiche'],['wireCorrection','UART-Zeitkorrektur'],['timingRejected','Verzögerte GPS-Sätze verworfen'],['gpsOverflows','GPS-Pufferüberläufe'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
-fields.splice(3,0,['pps','PPS (optional)']);
+const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['calibration','GPS-Kalibrierung'],['gpsOffset','GPS-Korrektur durch NTP'],['ntpDelay','NTP-Netzlaufzeit'],['calibrationSpread','Streuung der Vergleiche'],['wireCorrection','UART-Zeitkorrektur'],['timingRejected','Verzögerte GPS-Sätze verworfen'],['gpsOverflows','GPS-Pufferüberläufe'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','LAN-/WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
+fields.splice(3,0,['pps','PPS (optional)'],['board','Board'],['interface','Netzwerkschnittstelle'],['ipMode','IP-Konfiguration']);
 let configLoaded=false,resetting=false,updating=false;
 const svgNS='http://www.w3.org/2000/svg';
 function skyNode(tag,attrs,text){let el=document.createElementNS(svgNS,tag);for(let[k,v]of Object.entries(attrs))el.setAttribute(k,v);if(text!==undefined)el.textContent=text;document.querySelector('#sky').append(el);return el}
@@ -341,7 +403,7 @@ refresh();refreshSky();setInterval(()=>{refresh();refreshSky()},2000);
 
 const char SETUP_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WLAN einrichten · GPS NTP</title>
 <style>body{font:17px system-ui;background:#101b2d;color:#edf4ff;max-width:560px;margin:40px auto;padding:20px}section{background:#1c2c43;padding:24px;border-radius:16px}input,button,select{font:inherit;padding:12px;box-sizing:border-box;border-radius:8px;border:0;margin:8px 0 18px;width:100%}button{background:#72dcbd;color:#10251f;cursor:pointer}button:disabled{opacity:.5;cursor:wait}small{color:#bac8db}a{color:#72dcbd}p{overflow-wrap:anywhere}</style>
-<h1>WLAN einrichten</h1><p>Verbinde deinen GPS-NTP-Server mit deinem WLAN.</p><section>
+<h1>WLAN einrichten</h1><p><a href="/network">Ethernet / IP-Konfiguration</a></p><p>Verbinde deinen GPS-NTP-Server mit deinem WLAN.</p><section>
 <label for="networks">Verfügbare Netzwerke</label><select id="networks"><option value="">Netzwerke werden gesucht …</option></select><button id="scan" type="button">Erneut suchen</button><p id="scanState" role="status"></p>
 <form id="wifi"><label>Netzwerkname (SSID)<input id="ssid" name="ssid" maxlength="32" required autocomplete="off" placeholder="Netz auswählen oder manuell eingeben"></label><label>WLAN-Passwort<input id="password" name="password" type="password" maxlength="64" autocomplete="new-password"></label><label><input id="showPassword" type="checkbox" style="width:auto;margin:0 8px 16px 0">Passwort anzeigen</label><button id="connect">Speichern und verbinden</button></form><p id="message" role="status"></p><p id="success" hidden><a id="dashboard" href="/dashboard">Zur Statusseite</a><br><small>Falls der Einrichtungs-AP schließt: mit deinem WLAN verbinden und die angezeigte Adresse öffnen.</small></p><small>Versteckte Netzwerke können manuell eingegeben werden. Bei offenen Netzwerken bleibt das Passwort leer.</small></section>
 <script>
@@ -373,7 +435,7 @@ bool setupClient() {
   return portal && web.client().localIP() == WiFi.softAPIP();
 }
 bool otaAllowed(const char *action = "update") {
-  return WiFi.status() == WL_CONNECTED && !setupClient() && !resetPending &&
+  return networkConnected() && !setupClient() && !resetPending &&
          !otaRestartPending && otaPassword.length() &&
          web.header("X-Device-Action") == action && web.header("X-Update-Password") == otaPassword;
 }
@@ -389,12 +451,11 @@ void uploadFirmware() {
     bool numeric = sizeHeader.length() > 0 && sizeHeader.length() <= 8;
     for (size_t i = 0; i < sizeHeader.length(); ++i) if (sizeHeader[i] < '0' || sizeHeader[i] > '9') numeric = false;
     uint32_t size = numeric ? strtoul(sizeHeader.c_str(), nullptr, 10) : 0;
-    uint32_t freeSpace = ESP.getFreeSketchSpace();
-    uint32_t maximum = freeSpace > 0x1000 ? (freeSpace - 0x1000) & 0xFFFFF000 : 0;
+    uint32_t maximum = firmwareCapacity();
     if (upload.name != "firmware" || !filename.endsWith(".bin") || size < 16 || size > maximum) {
-      otaError = "Ungueltige Firmware-Datei oder Dateigroesse (D1-mini-.bin erforderlich)."; return;
+      otaError = "Ungueltige Firmware-Datei oder Dateigroesse (passende Board-Firmware erforderlich)."; return;
     }
-    otaWriter.reset(new UpdaterClass());
+    otaWriter.reset(new FirmwareUpdater());
     if (!otaWriter->begin(size, U_FLASH)) { otaError = otaWriter->getErrorString(); otaWriter.reset(); }
     else Serial.printf("[OTA] Upload gestartet: %lu Bytes\n", static_cast<unsigned long>(size));
   } else if (upload.status == UPLOAD_FILE_WRITE && otaWriter && !otaError.length()) {
@@ -411,7 +472,7 @@ void uploadFirmware() {
 }
 void finishFirmware() {
   web.sendHeader("Cache-Control", "no-store");
-  if (!otaAllowed()) { web.send(403, "text/plain; charset=utf-8", "Update nur ueber WLAN-IP mit gueltigem OTA-Passwort erlaubt."); return; }
+  if (!otaAllowed()) { web.send(403, "text/plain; charset=utf-8", "Update nur ueber LAN-/WLAN-IP mit gueltigem OTA-Passwort erlaubt."); return; }
   bool success = otaFiles == 1 && otaEnded && otaWriter && !otaError.length();
   if (success && !otaWriter->end()) { otaError = otaWriter->getErrorString(); success = false; }
   otaWriter.reset(); otaFiles = 0; otaEnded = false;
@@ -427,7 +488,7 @@ void finishFirmware() {
 void home() {
   web.sendHeader("Cache-Control", "no-store");
   web.send_P(200, "text/html; charset=utf-8",
-             !setupClient() && WiFi.status() == WL_CONNECTED ? PAGE : SETUP_PAGE);
+             !setupClient() && networkConnected() ? PAGE : SETUP_PAGE);
 }
 void networks() {
   if (!portal) { web.send(403, "text/plain", "WLAN-Suche nur im Setup-Modus."); return; }
@@ -445,7 +506,7 @@ void networks() {
   for (int i = 0; i < count && i < 30; ++i) {
     if (i) result += ',';
     result += "{\"ssid\":" + jsonString(WiFi.SSID(i)) + ",\"rssi\":" + String(WiFi.RSSI(i)) +
-              ",\"open\":" + (WiFi.encryptionType(i) == ENC_TYPE_NONE ? "true" : "false") + "}";
+              ",\"open\":" + (WiFi.encryptionType(i) == OPEN_ENCRYPTION ? "true" : "false") + "}";
   }
   web.send(200, "application/json", result + "]");
 }
@@ -467,6 +528,7 @@ void startPortal() {
   Serial.printf("Setup: %s / gpssetup8266 / 192.168.4.1\n", apName.c_str());
 }
 void status() {
+  StateGuard guard;
   String utc = "—";
   if (synchronized()) {
     time_t now = referenceSeconds + uint32_t(micros() - referenceMicros) / 1000000;
@@ -477,11 +539,11 @@ void status() {
   auto field = [&json](const char *key, const String &value) { json += ",\"" + String(key) + "\":\"" + value + "\""; };
   field("utc", utc);
   field("source", synchronized() ? (ppsTime ? "GPS + PPS" : networkTime ? "Notfall-NTP" : gpsCalibrated ? "GPS + NTP-Kalibrierung" : "GPS (NMEA)") : "keine");
-  field("pps", ppsBlocked ? "UTC-Zuordnung widerspricht NTP; 60 s gesperrt" : ppsTime ? "synchronisiert" : ppsClock.detected(micros()) ? "Impulse erkannt; warte auf stabile UTC-Zuordnung" : "kein PPS erkannt (optional D6/GPIO12)");
+  field("pps", ppsBlocked ? "UTC-Zuordnung widerspricht NTP; 60 s gesperrt" : ppsTime ? "synchronisiert" : ppsClock.detected(micros()) ? "Impulse erkannt; warte auf stabile UTC-Zuordnung" : "kein PPS erkannt (optional; Pins siehe README)");
   field("stratum", synchronized() ? String(clockStratum) : "16 (unsynchronisiert)");
   field("fallbackHost", fallbackHost.length() ? fallbackHost : "deaktiviert");
   field("fallbackState", !fallbackHost.length() ? "deaktiviert" :
-        WiFi.status() != WL_CONNECTED ? "warte auf WLAN" : fallbackState);
+        !networkConnected() ? "warte auf Netzwerk" : fallbackState);
   field("satellites", gps.satellites.isValid() && gps.satellites.age() < 5000 ? String(gps.satellites.value()) : "—");
   field("visible", satelliteView.fresh(millis()) ? String(satelliteView.count()) : "—");
   field("hdop", gps.hdop.isValid() && gps.hdop.age() < 5000 ? String(gps.hdop.hdop(), 1) : "—");
@@ -494,29 +556,62 @@ void status() {
   field("timingRejected", String(gpsTimingRejected));
   field("gpsOverflows", String(gpsOverflows));
   field("age", clockValid ? String((millis() - lastSyncMillis) / 1000) + " s" : "—");
-  field("ip", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "nicht verbunden");
+  field("ip", networkConnected() ? networkIP().toString() : "nicht verbunden");
+  field("board", BOARD_NAME);
+  field("interface", ethernetConnected() ? "Ethernet" : "WLAN");
+  field("ipMode", useDhcp ? "DHCP" : "statisch (primaere Schnittstelle)");
   field("ap", portal ? WiFi.softAPIP().toString() : "aus");
   field("rssi", WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) + " dBm" : "—");
   field("requests", String(requests)); json += "}";
+  guard.unlock();
   web.sendHeader("Cache-Control", "no-store"); web.send(200, "application/json", json);
 }
 void setup() {
+#ifdef ESP32
+  clockMutex = xSemaphoreCreateRecursiveMutex();
+  if (!clockMutex) { delay(1000); ESP.restart(); return; }
+#endif
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[BOOT] GPS-NTP startet");
-  Serial.printf("[BOOT] Reset-Ursache: %s\n", ESP.getResetReason().c_str());
-  gpsSerial.begin(9600, SWSERIAL_8N1, D5, -1, false, 128, 1024);
+  Serial.printf("[BOOT] Reset-Ursache: %s\n", resetReason().c_str());
+#ifdef ESP32
+  gpsSerial.setRxBufferSize(2048);
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, -1);
+  gpsSerial.setRxFIFOFull(1);
+  gpsSerial.setRxTimeout(1);
+  gpsSerial.onReceiveError([](hardwareSerial_error_t error) {
+    if (error == UART_BUFFER_FULL_ERROR || error == UART_FIFO_OVF_ERROR) gpsRxOverflow.store(true);
+  });
+#else
+  gpsSerial.begin(9600, SWSERIAL_8N1, GPS_RX_PIN, -1, false, 128, 1024);
+#endif
 #if GPS_PPS_ENABLED
-  pinMode(D6, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(D6), onPps, RISING);
-  Serial.println("[GPS] Optionaler PPS-Eingang: D6 / GPIO12.");
+  pinMode(GPS_PPS_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(GPS_PPS_PIN), onPps, RISING);
+  Serial.printf("[GPS] PPS GPIO%d; GPS-TX an GPIO%d.\n", GPS_PPS_PIN, GPS_RX_PIN);
 #endif
   loadFallback();
   loadOtaPassword();
-  WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.hostname("gps-ntp");
-  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  loadNetworkConfig();
+  WiFi.persistent(false); WiFi.mode(WIFI_STA);
+#ifdef ESP32
+  WiFi.setHostname("gps-ntp"); WiFi.setSleep(false);
+#else
+  WiFi.hostname("gps-ntp"); WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+#ifndef ESP32
+  if (!useDhcp) WiFi.config(staticIp, staticGateway, staticMask, staticDns);
+  else WiFi.config(IPAddress(0U), IPAddress(0U), IPAddress(0U));
+#else
+  if (!ETH.begin(1, 16, 23, 18, ETH_PHY_LAN8720, ETH_CLOCK_GPIO0_IN)) Serial.println("[ETH] Start fehlgeschlagen.");
+  else {
+    ETH.setHostname("gps-ntp");
+    if (!useDhcp && !ETH.config(staticIp, staticGateway, staticMask, staticDns)) Serial.println("[ETH] Statische Konfiguration fehlgeschlagen.");
+  }
+#endif
   WiFi.setAutoReconnect(true); WiFi.begin();
-  apName = "GPS-NTP-" + String(ESP.getChipId(), HEX);
+  apName = "GPS-NTP-" + String(deviceId(), HEX);
   disconnectedAt = millis();
   if (WiFi.SSID().length() == 0) {
     Serial.println("[WLAN] Keine gespeicherten Zugangsdaten: Setup sofort starten.");
@@ -524,25 +619,65 @@ void setup() {
   } else {
     Serial.println("[WLAN] Verbinde mit gespeichertem WLAN; Setup-Fallback nach 20 Sekunden.");
   }
+#ifdef ESP32
+  startPortal(); // Recovery window even if a wrong static address looks connected.
+#else
+  if (!useDhcp) startPortal();
+#endif
   web.on("/", HTTP_GET, home);
   web.on("/dashboard", HTTP_GET, home);
   web.on("/setup", HTTP_GET, [] {
-    if (portal || WiFi.status() != WL_CONNECTED) { web.sendHeader("Cache-Control", "no-store"); web.send_P(200, "text/html; charset=utf-8", SETUP_PAGE); }
+    if (portal || !networkConnected()) { web.sendHeader("Cache-Control", "no-store"); web.send_P(200, "text/html; charset=utf-8", SETUP_PAGE); }
     else { web.sendHeader("Location", "/"); web.send(302, "text/plain", ""); }
   });
   web.on("/api/networks", HTTP_GET, networks);
   web.on("/api/wifi", HTTP_GET, [] {
-    bool connected = WiFi.status() == WL_CONNECTED;
+    bool connected = networkConnected();
     uint32_t attemptAge = millis() - lastRetry;
     bool failed = !connected && (attemptAge >= 20000 || (attemptAge >= 3000 &&
                   (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL)));
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "application/json", String("{\"connected\":") + (connected ? "true" : "false") +
              ",\"failed\":" + (failed ? "true" : "false") + ",\"setupClient\":" + (setupClient() ? "true" : "false") +
-             ",\"ip\":" + jsonString(connected ? WiFi.localIP().toString() : "") + "}");
+             ",\"ip\":" + jsonString(connected ? networkIP().toString() : "") + "}");
   });
   web.on("/api/status", HTTP_GET, status);
+  web.on("/network", HTTP_GET, [] {
+    web.sendHeader("Cache-Control", "no-store"); web.send_P(200, "text/html; charset=utf-8", NETWORK_PAGE);
+  });
+  web.on("/api/network", HTTP_GET, [] {
+    String json = "{\"board\":" + jsonString(BOARD_NAME) + ",\"target\":" + jsonString(
+#ifdef ESP32
+      "Ethernet (WLAN-Reserve verwendet DHCP)"
+#else
+      "WLAN"
+#endif
+    ) + ",\"current\":" + jsonString(networkConnected() ? networkIP().toString() : "nicht verbunden") +
+      ",\"mode\":" + jsonString(useDhcp ? "dhcp" : "static") + ",\"ip\":" + jsonString(staticIp.toString()) +
+      ",\"mask\":" + jsonString(staticMask.toString()) + ",\"gateway\":" + jsonString(staticGateway.toString()) +
+      ",\"dns\":" + jsonString(staticDns.toString()) + "}";
+    web.sendHeader("Cache-Control", "no-store"); web.send(200, "application/json", json);
+  });
+  web.on("/network", HTTP_POST, [] {
+    if (networkRestartPending || resetPending || otaRestartPending || otaFiles) { web.send(409, "text/plain", "Andere Aktion laeuft bereits."); return; }
+    if (!otaPassword.length() || web.header("X-Device-Action") != "network" || web.header("X-Update-Password") != otaPassword) {
+      web.send(403, "text/plain", "Gueltiges OTA-Passwort erforderlich."); return;
+    }
+    String mode = web.arg("mode");
+    if (mode != "dhcp" && mode != "static") { web.send(400, "text/plain", "Ungueltiger IP-Modus."); return; }
+    bool dhcp = mode == "dhcp";
+    IPAddress ip, gateway, mask, resolver;
+    if (!dhcp && (!ip.fromString(web.arg("ip")) || !gateway.fromString(web.arg("gateway")) ||
+        !mask.fromString(web.arg("mask")) || !resolver.fromString(web.arg("dns")) ||
+        !IpConfig::valid(ipNumber(ip), ipNumber(gateway), ipNumber(mask), ipNumber(resolver)))) {
+      web.send(400, "text/plain; charset=utf-8", "Ungueltige IPv4-Konfiguration. Gateway muss im selben Subnetz liegen; Netz-/Broadcastadressen und das Setup-Netz 192.168.4.0/24 sind nicht erlaubt."); return;
+    }
+    if (!saveNetworkConfig(dhcp, ip, gateway, mask, resolver)) { web.send(500, "text/plain", "Speichern fehlgeschlagen."); return; }
+    web.send(200, "text/plain; charset=utf-8", dhcp ? "DHCP gespeichert. Neustart; neue IP im Router oder seriellen Monitor nachsehen." : "Statische IP gespeichert. Neustart; danach http://" + ip.toString() + "/ oeffnen.");
+    networkRestartAt = millis(); networkRestartPending = true;
+  });
   web.on("/api/sky", HTTP_GET, [] {
+    StateGuard guard;
     bool positionValid = gps.location.isValid() && gps.location.age() < 5000;
     bool fresh = satelliteView.fresh(millis());
     String json = String("{\"positionValid\":") + (positionValid ? "true" : "false") +
@@ -558,13 +693,19 @@ void setup() {
               ",\"azimuth\":" + (sat.azimuth < 0 ? String("null") : String(sat.azimuth)) +
               ",\"snr\":" + (sat.snr < 0 ? String("null") : String(sat.snr)) + "}";
     }
+    guard.unlock();
     web.sendHeader("Cache-Control", "no-store"); web.send(200, "application/json", json + "]}");
   });
+#ifdef ESP32
+  const char *headers[] = {"X-Device-Action", "X-Update-Password", "X-Firmware-Size"};
+  web.collectHeaders(headers, 3);
+#else
   web.collectHeaders("X-Device-Action", "X-Update-Password", "X-Firmware-Size");
+#endif
   web.on("/update", HTTP_POST, finishFirmware, uploadFirmware);
   web.on("/ota-password", HTTP_POST, [] {
     web.sendHeader("Cache-Control", "no-store");
-    if (!otaAllowed("change-password")) { web.send(403, "text/plain; charset=utf-8", "Aktuelles OTA-Passwort falsch oder Zugriff nicht ueber WLAN-IP."); return; }
+    if (!otaAllowed("change-password")) { web.send(403, "text/plain; charset=utf-8", "Aktuelles OTA-Passwort falsch oder Zugriff nicht ueber LAN-/WLAN-IP."); return; }
     if (otaFiles) { web.send(409, "text/plain", "Firmware-Upload noch aktiv. Bitte kurz warten."); return; }
     String password = web.arg("password");
     if (!validOtaPassword(password) || password != web.arg("confirmation")) {
@@ -582,10 +723,12 @@ void setup() {
     }
     if (!saveFallback(host)) { web.send(500, "text/plain", "Speichern fehlgeschlagen."); return; }
     fallbackHost = host; upstreamPending = false; upstreamAttempted = false; upstream.stop();
+    StateGuard guard;
     gpsCalibration.reset(); ntpMeasured = false;
     fallbackState = host.length() ? "bereit" : "deaktiviert";
     if (networkTime) clockValid = false;
     else if (gpsSeen) applyGpsReference();
+    guard.unlock();
     web.send(200, "text/plain; charset=utf-8", host.length() ? "Notfall-NTP gespeichert." : "Notfall-NTP deaktiviert.");
   });
   web.on("/reset-wifi", HTTP_POST, [] {
@@ -615,8 +758,38 @@ void setup() {
   });
   web.begin();
   Serial.printf("[BOOT] HTTP bereit; NTP-Port: %s\n", ntp.begin(123) ? "bereit" : "Fehler");
+#ifdef ESP32
+  if (xTaskCreatePinnedToCore(timingTask, "gps-ntp", 8192, nullptr, 3, nullptr, 1) != pdPASS ||
+      xTaskCreatePinnedToCore(webTask, "web-config", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
+    Serial.println("[BOOT] Task-Start fehlgeschlagen."); delay(1000); ESP.restart();
+  }
+#endif
 }
-void loop() {
+void timingStep() {
+  StateGuard guard;
+  capturePps();
+  if (ppsTime && !ppsClock.locked(micros())) applyGpsReference();
+  readGps();
+  if (!networkTime && gpsCalibrated && !gpsCalibration.ready(millis())) applyGpsReference();
+  serveNtp();
+}
+void networkLoop() {
+#ifdef ESP32
+  static bool usedEthernet = false;
+  static bool usedWifi = false;
+  bool preferEthernet = ethernetConnected();
+  bool connectedWifi = WiFi.status() == WL_CONNECTED;
+  if (preferEthernet != usedEthernet || connectedWifi != usedWifi) {
+    selectDefaultNetwork(preferEthernet);
+    usedEthernet = preferEthernet;
+    usedWifi = connectedWifi;
+    upstream.stop(); upstreamPending = false; upstreamAttempted = false;
+  }
+#endif
+  if (networkRestartPending) {
+    if (uint32_t(millis() - networkRestartAt) >= 1000) ESP.restart();
+    delay(1); return;
+  }
   if (otaRestartPending) {
     if (uint32_t(millis() - otaRestartAt) >= 1000) ESP.restart();
     yield(); return;
@@ -626,19 +799,23 @@ void loop() {
     Serial.println("[OTA] Unvollstaendiger Upload verworfen (Timeout).");
   }
   if (resetPending && uint32_t(millis() - resetAt) >= 500) {
-    WiFi.persistent(true); WiFi.disconnect(true); WiFi.persistent(false);
+    WiFi.persistent(true);
+#ifdef ESP32
+    WiFi.disconnect(false, true);
+#else
+    WiFi.disconnect(true);
+#endif
+    WiFi.persistent(false);
     ESP.restart(); return;
   }
-  capturePps();
-  if (ppsTime && !ppsClock.locked(micros())) applyGpsReference();
-  readGps();
-  if (!networkTime && gpsCalibrated && !gpsCalibration.ready(millis())) applyGpsReference();
-  serveNtp();
+#ifndef ESP32
+  timingStep();
+#endif
   pollFallback();
-  if (WiFi.status() == WL_CONNECTED) {
+  if (networkConnected()) {
     if (!wifiWasConnected) {
       connectedSince = millis(); wifiWasConnected = true;
-      Serial.printf("[WLAN] Verbunden. Statusseite: http://%s/\n", WiFi.localIP().toString().c_str());
+      Serial.printf("[WLAN] Verbunden. Statusseite: http://%s/\n", networkIP().toString().c_str());
     }
     disconnectedAt = millis();
     if (!mdns) { mdns = MDNS.begin("gps-ntp"); if (mdns) { MDNS.addService("http", "tcp", 80); MDNS.addService("ntp", "udp", 123); } }
@@ -648,17 +825,40 @@ void loop() {
     wifiWasConnected = false;
     if (millis() - disconnectedAt > 20000) startPortal();
     if (millis() - lastRetry > 30000) { WiFi.reconnect(); lastRetry = millis(); }
-    if (mdns) { MDNS.close(); mdns = false; }
+    if (mdns) {
+#ifdef ESP32
+      MDNS.end();
+#else
+      MDNS.close();
+#endif
+      mdns = false;
+    }
   }
   if (portal) dns.processNextRequest();
-  readGps(); serveNtp();
+#ifndef ESP32
+  timingStep();
+#endif
   web.handleClient();
-  readGps(); serveNtp(); if (mdns) MDNS.update(); yield();
+#ifndef ESP32
+  timingStep();
+  if (mdns) MDNS.update();
+#endif
+  yield();
   if (uint32_t(millis() - lastDiagnostic) >= 10000) {
     lastDiagnostic = millis();
+    StateGuard guard;
+    unsigned long gpsCharacters = gps.charsProcessed();
+    guard.unlock();
     Serial.printf("[STATUS] Laufzeit=%lu s WLAN=%d AP=%s AP-IP=%s GPS-Zeichen=%lu Heap=%lu\n",
                   millis() / 1000UL, int(WiFi.status()), portal ? apName.c_str() : "aus",
-                  WiFi.softAPIP().toString().c_str(), static_cast<unsigned long>(gps.charsProcessed()),
+                  WiFi.softAPIP().toString().c_str(), gpsCharacters,
                   static_cast<unsigned long>(ESP.getFreeHeap()));
   }
 }
+#ifdef ESP32
+void timingTask(void *) { for (;;) { timingStep(); vTaskDelay(1); } }
+void webTask(void *) { for (;;) { networkLoop(); vTaskDelay(1); } }
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
+#else
+void loop() { networkLoop(); }
+#endif

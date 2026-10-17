@@ -1,8 +1,46 @@
-# GPS-NTP mit Wemos D1 mini
+# GPS-NTP mit Wemos D1 mini oder WT32-ETH01
 
 ESP8266-Firmware für einen lokalen NTP-Server (UDP 123), der UTC vom u-blox NEO-6M-0-001 bezieht. Kein Internet-Zeitserver erforderlich. Deutsche Statusseite mit Satelliten im Fix, sichtbaren Satelliten, HDOP, Alter der Zeitübernahme, geschätzter Zeitunsicherheit und WLAN-Status.
 
-## Verdrahtung
+Zusätzlich wird das **WT32-ETH01 (ESP32 mit LAN8720-Ethernet)** unterstützt. Beide Boards verwenden dieselben Webfunktionen einschließlich Captive Portal, NTP-Kalibrierung, Satellitenansicht und Web-OTA. Ethernet hat beim WT32 Vorrang vor einer vorhandenen WLAN-Verbindung.
+
+## WT32-ETH01
+
+| GPS | WT32-ETH01 |
+| --- | --- |
+| TX | GPIO14 (Hardware-UART2 RX) |
+| GND | GND |
+| PPS / TIMEPULSE | optional GPIO33 / `485_EN` |
+| RX | nicht benötigt |
+| VCC | gemäß GPS-Trägerplatine |
+
+Nur 3,3-V-GPIO-Signale verwenden. GPIO33 darf nicht gleichzeitig für andere Funktionen verwendet werden. Ethernet-Pins einschließlich GPIO0 (50-MHz-Eingang), GPIO16 (PHY-Power), GPIO18 (MDIO) und GPIO23 (MDC) bleiben dem Board vorbehalten. Der PHY wird mit Adresse 1 als LAN8720 initialisiert. Grundlage ist die [WT32-ETH01-Variante des ESP32 Arduino Core](https://github.com/espressif/arduino-esp32/blob/2.0.17/variants/wt32-eth01/pins_arduino.h).
+
+```sh
+pio run -e wt32_eth01
+pio run -e wt32_eth01 -t upload
+pio device monitor -e wt32_eth01
+```
+
+Das WT32 benötigt für den ersten Upload einen externen USB-UART-Adapter mit 3,3-V-Logik und eine geeignete Versorgung. TX0/RX0 gekreuzt anschließen, gemeinsame Masse verwenden und GPIO0 für den seriellen Download beim Reset auf GND legen. Anschließend GPIO0 wieder freigeben und neu starten; im Normalbetrieb wird dieser Anschluss für Ethernet benötigt. Die konkrete Boardrevision und deren Anschlussbezeichnungen prüfen.
+
+Im Normalbetrieb Netzwerkkabel anschließen: standardmäßig wird die Ethernet-IP per DHCP bezogen. Die IP steht im seriellen Monitor und auf der Statusseite. Beim Start wird für die Wiederherstellung zusätzlich der WLAN-AP geöffnet. Besteht eine LAN- oder WLAN-Verbindung, schließt er nach ungefähr 60 Sekunden. Ohne Verbindung bleibt das Setup erreichbar. Über die AP-IP bleibt das WLAN-Setup sichtbar; dort führt **Ethernet / IP-Konfiguration** zu den Netzwerkeinstellungen. WLAN-Zugangsdaten sind für den Ethernet-Betrieb nicht erforderlich.
+
+### Nutzung beider ESP32-Kerne
+
+Auf **Core 1** läuft ein eigener Task mit höherer Priorität für GPS-Auswertung, PPS-Zuordnung und NTP-Antworten. **Core 0** verarbeitet Weboberfläche, Konfiguration und NTP-Upstream-Abfragen. DNS läuft auf Core 0 in einem separaten Worker und blockiert die GPS-/NTP-Verarbeitung nicht. Gemeinsame Zeitdaten werden über einen rekursiven Mutex geschützt; PPS-ISR-Daten über einen kurzen Spinlock. Webantworten werden nach dem Freigeben des Zeitdaten-Mutex gesendet.
+
+Der Hardware-UART verwendet einen 2048-Byte-Empfangspuffer und einen niedrigen FIFO-Schwellwert, damit NMEA-Sätze zeitnah verarbeitet werden. Beide Kerne werden für getrennte Aufgaben genutzt; sie berechnen keine konkurrierenden Zeitwerte. Ethernet und die Aufteilung können Latenzschwankungen reduzieren, garantieren aber keine konkrete Genauigkeit. Flash-Schreibvorgänge und OTA können weiterhin beide Kerne bzw. Interrupts beeinflussen. Die tatsächliche Genauigkeit muss unter Last mit Hardware gemessen werden.
+
+## DHCP oder statische IP
+
+Auf Status- und Setup-Seite führt **IP-Konfiguration** bzw. **Ethernet / IP-Konfiguration** zu `/network`. Dort zwischen DHCP und statischer IPv4 wählen. Bei statischer Konfiguration IP-Adresse, Subnetzmaske, Gateway und DNS-Server eintragen. Zum Speichern ist das aktuelle OTA-Passwort erforderlich (Standard `gpsntp-update`). Das Gerät speichert die Einstellungen dauerhaft und startet neu.
+
+Die Einstellung gilt beim **WT32 für Ethernet**, beim **D1 mini für WLAN**. Das optionale WLAN am WT32 bleibt bei DHCP, damit Ethernet und WLAN nicht dieselbe feste IP erhalten. Ungültige Masken, Netz-/Broadcastadressen, ein Gateway außerhalb des Subnetzes und eine Überschneidung mit dem Setup-Netz `192.168.4.0/24` werden abgelehnt. Der Server prüft nicht, ob eine gewählte Adresse bereits von einem anderen Gerät verwendet wird.
+
+Bei falscher statischer IP: Gerät neu starten, innerhalb des Wiederherstellungsfensters mit `GPS-NTP-…` verbinden und `http://192.168.4.1/network` öffnen. Dort die Adresse korrigieren oder DHCP wählen. Bei statischer Konfiguration wird der AP auf beiden Boards bei jedem Neustart geöffnet und bleibt bei bestehender Verbindung mindestens ungefähr 60 Sekunden verfügbar. Ein WLAN-Reset löscht ausschließlich WLAN-Zugangsdaten; die IP-Konfiguration bleibt gespeichert.
+
+## Verdrahtung D1 mini
 
 | GPS | D1 mini |
 | --- | --- |
@@ -19,9 +57,9 @@ GPIO am ESP8266 vertragen nur 3,3 V. Das nackte NEO-6M-Modul benötigt 2,7–3,6
 PlatformIO installieren, dann im Projektverzeichnis:
 
 ```sh
-pio run
-pio run -t upload
-pio device monitor
+pio run -e d1_mini
+pio run -e d1_mini -t upload
+pio device monitor -e d1_mini
 ```
 
 1. Ohne gespeicherte Zugangsdaten öffnet der ESP sofort den AP `GPS-NTP-<Chip-ID>` mit Passwort `gpssetup8266`. Mit gespeicherten Daten startet der AP nach 20 Sekunden ohne WLAN-Verbindung.
@@ -40,7 +78,7 @@ Nach dem Upload den Monitor mit 115200 Baud öffnen und einmal die Reset-Taste a
 
 ## Optionales PPS-Signal
 
-Der NEO-6M besitzt an Modul-Pin 3 den Ausgang TIMEPULSE. Falls dieser an deiner Trägerplatine zugänglich ist, zusätzlich mit **D6 / GPIO12** verbinden. TX bleibt an D5, die Masse muss gemeinsam sein. Nur ein 3,3-V-kompatibles Signal verwenden. Ohne PPS-Leitung bleibt D6 frei und die bisherige NMEA-/NTP-Zeitübernahme funktioniert weiter. Die optionale Erkennung ist standardmäßig aktiv; mit `-D GPS_PPS_ENABLED=0` in den PlatformIO-Build-Flags lässt sie sich vollständig abschalten.
+Der NEO-6M besitzt an Modul-Pin 3 den Ausgang TIMEPULSE. Falls dieser an deiner Trägerplatine zugänglich ist, zusätzlich beim **D1 mini mit D6 / GPIO12**, beim **WT32 mit GPIO33 / 485_EN** verbinden. GPS-TX bleibt beim D1 mini an D5 / GPIO14 und beim WT32 an GPIO14, die Masse muss gemeinsam sein. Nur ein 3,3-V-kompatibles Signal verwenden. Ohne PPS-Leitung bleibt der jeweilige Eingang frei und die bisherige NMEA-/NTP-Zeitübernahme funktioniert weiter. Die optionale Erkennung ist standardmäßig aktiv; mit `-D GPS_PPS_ENABLED=0` in den PlatformIO-Build-Flags lässt sie sich vollständig abschalten.
 
 Vorausgesetzt wird die Werkskonfiguration: **1 Hz, steigende Flanke auf der UTC-Sekundengrenze, nachfolgender RMC-Satz für dieselbe Sekunde**. Anders konfigurierte Frequenz, Polarität oder eine um ganze Sekunden verschobene Ausgabe müssen zuerst korrigiert werden. Die Firmware ordnet einen zeitnah verarbeiteten ganzsekündigen RMC-Satz dem vorausgehenden Puls zu. Der Satzanfang muss 10–800 ms nach dem Puls liegen. Drei aufeinanderfolgende Zuordnungen, Pulsabstände von 1 s ±2 ms und eine stabile RMC-Verzögerung innerhalb 20 ms sind für die Aktivierung nötig. Regelmäßige Pulse allein beweisen keine richtige UTC-Zuordnung.
 
@@ -60,7 +98,7 @@ Die Firmware wertet die standardmäßig ausgegebenen `GPGSV`-Nachrichten des NEO
 
 In der Weboberfläche unter **Notfall-NTP** einen Vorschlag auswählen oder einen eigenen Hostnamen bzw. eine IPv4-Adresse eintragen. Keine URL und keinen Port angeben. **Notfall-NTP speichern** speichert die Auswahl dauerhaft im EEPROM-Bereich des Flashs. Ein leeres Feld deaktiviert den Ersatzserver; im Auslieferungszustand ist er deaktiviert. Die Vorschläge entsprechen den Zonen des [NTP Pool Project](https://www.ntppool.org/en/use.html).
 
-Der ESP fragt den eingestellten Server alle 30 Sekunden ab, auch bei GPS-Empfang. Bei gültigem GPS dient NTP zur Kalibrierung der seriellen Zeit. Sobald seit fünf Sekunden keine neue gültige GPS-Zeit übernommen wurde (oder beim Start noch keine vorliegt), wird NTP direkt als Ersatzzeit verwendet. UDP-Antworten werden ohne Warteschleife verarbeitet; die DNS-Auflösung kann pro Versuch bis zu einer Sekunde dauern. Ein externer Server benötigt Internetzugang, ein lokaler Server nur Erreichbarkeit im LAN.
+Der ESP fragt den eingestellten Server alle 30 Sekunden ab, auch bei GPS-Empfang. Bei gültigem GPS ohne PPS dient NTP zur Kalibrierung der seriellen Zeit; mit PPS als Plausibilitätsvergleich. Sobald seit fünf Sekunden keine neue gültige GPS-Zeit übernommen wurde (oder beim Start noch keine vorliegt), wird NTP direkt als Ersatzzeit verwendet. UDP-Antworten werden ohne Warteschleife verarbeitet. Beim ESP8266 kann DNS pro Versuch bis zu einer Sekunde blockieren; beim ESP32 läuft DNS im separaten Worker, dessen interner Timeout bis etwa 15 Sekunden dauern kann. Ein externer Server benötigt Internetzugang, ein lokaler Server nur Erreichbarkeit im LAN.
 
 Die Statusseite zeigt aktive Zeitquelle, Stratum, Ersatzserver, Abfragestatus, GPS-Korrektur, Netzlaufzeit und Streuung der Vergleichswerte. Bei Ersatzzeit meldet der ESP das Stratum des vorgelagerten Servers plus eins; Stratum 0 (einschließlich Kiss-o'-Death), 15 und 16 werden nicht übernommen. Absender, Port, Anfragekennung, Version, Modus, Synchronisationsstatus, Datum und Root-Distanz werden geprüft. Diese Prüfungen sind keine kryptografische Authentifizierung. Kommt GPS zurück, wird wieder GPS-Zeit verwendet.
 
@@ -80,10 +118,10 @@ Die NTP-Unsicherheit schätzt sich aus vorgelagerter Root-Dispersion, halber Roo
 
 ## Firmware-Update im Browser (OTA)
 
-Diese Version einmal per USB installieren. Danach können weitere Firmware-Versionen über **Firmware aktualisieren** auf der normalen Statusseite hochgeladen werden. Die Funktion ist nur über die WLAN-IP bzw. `http://gps-ntp.local/` erreichbar; über den Einrichtungs-AP werden keine Updates angenommen.
+Diese Version einmal seriell installieren. Danach können weitere Firmware-Versionen über **Firmware aktualisieren** auf der normalen Statusseite hochgeladen werden. Die Funktion ist über die LAN-/WLAN-IP bzw. `http://gps-ntp.local/` erreichbar; über den Einrichtungs-AP werden keine Updates angenommen.
 
 1. Das feste **OTA-Standardpasswort lautet `gpsntp-update`**. Unter **OTA-Passwort ändern** auf der Statusseite kann es mit dem aktuellen Passwort geändert werden. Das neue Passwort zweimal eingeben (8–64 druckbare ASCII-Zeichen ohne Leerzeichen) und speichern. Die Änderung gilt sofort und bleibt nach Neustarts, OTA-Updates und WLAN-Reset erhalten. Das Passwort wird weder über die Status-API noch im seriellen Monitor ausgegeben. Ein vollständiges Löschen des Flashs stellt den Standard wieder her. Beim erstmaligen Wechsel von der früheren Firmware mit zufälligem Passwort wird dieses einmal durch `gpsntp-update` ersetzt; anschließend bleiben selbst gesetzte Passwörter erhalten. Wird diese Version noch mit der früheren OTA-Firmware hochgeladen, gilt für diesen einen Upload zunächst deren bisheriges Passwort.
-2. Die neue Firmware mit `pio run` für **d1_mini** bauen. Die Upload-Datei liegt unter **`.pio/build/d1_mini/firmware.bin`**. Keine `.elf`-, Dateisystem- oder Firmware-Datei für ein anderes Board verwenden.
+2. Die neue Firmware für das tatsächliche Board bauen: `pio run -e d1_mini` oder `pio run -e wt32_eth01`. Die Upload-Datei liegt unter **`.pio/build/d1_mini/firmware.bin`** bzw. **`.pio/build/wt32_eth01/firmware.bin`**. Niemals Firmware zwischen den Boards austauschen. Keine `.elf`-, Dateisystem-, Bootloader- oder Partitionierungsdatei hochladen. Beim WT32 wird eine OTA-fähige Partitionstabelle verwendet; der erste serielle Upload muss deshalb auch Bootloader und Partitionstabelle installieren.
 3. In der Statusseite die `.bin`-Datei auswählen, das OTA-Passwort eingeben und **Firmware hochladen und neu starten** bestätigen.
 4. Die Fortschrittsanzeige zeigt die Übertragung. Erst nach vollständig empfangener Datei und erfolgreicher Prüfung durch den ESP8266-Updater wird das Update für den nächsten Start aktiviert. Dateigröße, verfügbarer Speicher und ESP-Firmware-Kopf werden geprüft; dies ist keine Signaturprüfung und keine Garantie, dass die hochgeladene Anwendung funktioniert. Nur eigene, vertrauenswürdige Builds verwenden.
 5. Nach der Erfolgsmeldung startet der ESP automatisch neu. Kurz warten und die Seite neu laden. WLAN-Zugangsdaten, Notfall-NTP und OTA-Passwort bleiben bei Updates mit dieser Projektkonfiguration erhalten.
@@ -106,12 +144,16 @@ Für höhere GPS-Genauigkeit unabhängig von der seriellen Ausgabeverzögerung u
 
 ## Prüfung mit Hardware
 
+- WT32 mit Ethernet und ohne WLAN-Zugangsdaten starten: DHCP-IP, Weboberfläche und NTP auf der LAN-IP prüfen. Kabel abziehen und wieder verbinden; Wiederherstellung des AP bzw. Ethernet-Betriebs prüfen. Optional gespeichertes WLAN als Reserve testen.
+- Statische IP speichern, neu starten und alle vier gespeicherten Werte prüfen. Danach zurück auf DHCP wechseln. Eine falsche Adresse über den AP innerhalb des Wiederherstellungsfensters korrigieren. Änderungen müssen OTA-Passwort und Notfall-NTP beibehalten.
+- Auf dem WT32 unter wiederholten Webzugriffen GPS-/PPS-Zustand, NTP-Abweichung und Pufferüberläufe prüfen. Ebenso OTA auf jedem Board separat testen; keine konkrete Verbesserung allein aus der Kernaufteilung ableiten.
+
 - Erststart ohne gespeichertes WLAN: AP, DNS-Umleitung und WLAN-Speicherung prüfen.
 - Setup zeigt ausschließlich WLAN-Einrichtung: Netzsuche, erneute Suche, Auswahl inklusive Sonderzeichen in SSIDs, manuelle Eingabe und Passwortanzeige prüfen. Nach erfolgreicher Anmeldung muss die Statusseite über die WLAN-IP erreichbar sein; über den AP bleibt auch `/dashboard` beim Setup.
 - Während der 60 Sekunden nach erfolgreicher WLAN-Anmeldung über den AP `/`, `/dashboard` und eine Captive-Portal-Prüfadresse öffnen: alle müssen weiterhin das Setup zeigen bzw. dorthin umleiten. Gleichzeitig muss über die WLAN-IP die normale Statusoberfläche erreichbar sein.
 - Falsches Passwort und WLAN-Ausfall: Portal bleibt bzw. wird erneut erreichbar.
 - Unter freiem Himmel Satelliten und plausibles UTC-Datum prüfen.
-- Optional PPS mit D6 verbinden: nach drei stabilen Zuordnungen muss GPS + PPS erscheinen. PPS abziehen oder GPS-TX trennen: automatische Rückkehr zur bisherigen Zeitquelle prüfen. Korrekte UTC-Sekunde gegen eine unabhängige Referenz kontrollieren, insbesondere nach Änderungen der GPS-Konfiguration.
+- Optional PPS mit D6/GPIO12 (D1 mini) bzw. GPIO33 (WT32) verbinden: nach drei stabilen Zuordnungen muss GPS + PPS erscheinen. PPS abziehen oder GPS-TX trennen: automatische Rückkehr zur bisherigen Zeitquelle prüfen. Korrekte UTC-Sekunde gegen eine unabhängige Referenz kontrollieren, insbesondere nach Änderungen der GPS-Konfiguration.
 - Position und Höhe gegen einen bekannten Standort vergleichen. Im Satellitenhimmel müssen 0° Azimut oben und 90° rechts liegen; Satelliten bei 90° Elevation erscheinen in der Mitte. GPS-TX trennen: Position muss nach fünf Sekunden verschwinden, die Himmelsansicht nach zehn Sekunden.
 - Mit einem NTP-Client Synchronisationsstatus und Abweichung gegen eine unabhängige Quelle messen.
 - Bei laufendem GPS einen genauen NTP-Server eintragen: nach mindestens drei stabilen Vergleichen muss die Quelle auf GPS + NTP-Kalibrierung wechseln. Korrektur, Laufzeit, Streuung und NTP-Stratum prüfen. Den NTP-Server anschließend unerreichbar machen: spätestens nach Ablauf der Vergleichswerte muss die konservative GPS-Unsicherheit zurückkehren. Serverfeld leeren: Kalibrierung muss sofort verschwinden.
@@ -136,6 +178,8 @@ g++ -std=c++11 -Wall -Wextra -Iinclude tests/satellite_view_test.cpp -o /tmp/esp
 /tmp/esp-ntp-satellite-test
 g++ -std=c++11 -Wall -Wextra -Iinclude tests/pps_clock_test.cpp -o /tmp/esp-ntp-pps-test
 /tmp/esp-ntp-pps-test
+g++ -std=c++11 -Wall -Wextra -Iinclude tests/ip_config_test.cpp -o /tmp/esp-ntp-ip-test
+/tmp/esp-ntp-ip-test
 ```
 
 Grundlagen: [u-blox NEO-6 Datenblatt](https://content.u-blox.com/sites/default/files/products/documents/NEO-6_DataSheet_%28GPS.G6-HW-09005%29.pdf), [TinyGPSPlus](https://github.com/mikalhart/TinyGPSPlus), [ESP8266 Arduino Core](https://github.com/esp8266/Arduino).
