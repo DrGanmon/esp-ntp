@@ -38,6 +38,14 @@ Bei WLAN-Ausfall wird das Portal erneut geöffnet. Über **WLAN löschen und neu
 
 Nach dem Upload den Monitor mit 115200 Baud öffnen und einmal die Reset-Taste am D1 mini drücken. Nach spätestens 20 Sekunden sollte der AP sichtbar sein, wenn keine WLAN-Verbindung besteht. Falls der ESP bereits verbunden ist, zeigt das Terminal stattdessen die WLAN-IP. Ohne GPS-Modul muss die WLAN-Einrichtung ebenfalls funktionieren. Bleibt der Monitor völlig leer, Port und USB-Verbindung prüfen und testweise das GPS-Modul bei ausgeschalteter Versorgung abziehen. Das Einrichtungs-WLAN nutzt 2,4 GHz; die Setup-Adresse lautet `http://192.168.4.1/`.
 
+## Position und Satellitenhimmel
+
+Die normale Statusseite zeigt Breitengrad und Längengrad in WGS84 mit sechs Nachkommastellen, die Höhe über dem mittleren Meeresspiegel und das Alter des letzten Positionswerts. Position und Höhe werden nach fünf Sekunden ohne aktuelle Daten ausgeblendet. Viele Nachkommastellen bedeuten keine entsprechend hohe Ortsgenauigkeit; Empfangsbedingungen und Satellitengeometrie begrenzen die Genauigkeit. HDOP bleibt als Maß für die Positionsgeometrie sichtbar.
+
+Das Himmelsdiagramm zeigt die relativen Satellitenrichtungen vom Empfänger aus: Norden oben, Osten rechts, Horizont am Außenkreis und Zenit in der Mitte. Die Tabelle enthält PRN-Kennung, Azimut (0–359°), Elevation (0–90°) und den gemeldeten Signalwert C/N₀ in dB-Hz. Punkte mit positivem Signalwert sind grün, ohne Signalwert oder mit Wert null grau. Ein gemeldeter Signalwert bedeutet nicht automatisch, dass der Satellit für den Positionsfix verwendet wird. Satelliten ohne Winkelangaben erscheinen nur in der Tabelle. Entfernungen und absolute Umlaufpositionen werden nicht angezeigt.
+
+Die Firmware wertet die standardmäßig ausgegebenen `GPGSV`-Nachrichten des NEO-6M aus; alternativ wird auch `GNGSV` unterstützt. Nur vollständige, geordnete Nachrichtenfolgen mit gültigen Prüfsummen werden übernommen (bis zu 40 Satelliten). Die letzte vollständige Folge wird angezeigt; getrennte Konstellations-/Signalfolgen anderer Empfänger werden nicht zusammengeführt. Nach zehn Sekunden ohne vollständige Folge werden Diagramm und Tabelle geleert. Falls keine Satelliten erscheinen, prüfen, ob GSV-Ausgabe am GPS-Modul aktiviert ist. Die Ansicht benötigt keine externen Karten, Skripte oder Internetverbindung und aktualisiert sich alle zwei Sekunden.
+
 ## Notfall-NTP und GPS-Kalibrierung
 
 In der Weboberfläche unter **Notfall-NTP** einen Vorschlag auswählen oder einen eigenen Hostnamen bzw. eine IPv4-Adresse eintragen. Keine URL und keinen Port angeben. **Notfall-NTP speichern** speichert die Auswahl dauerhaft im EEPROM-Bereich des Flashs. Ein leeres Feld deaktiviert den Ersatzserver; im Auslieferungszustand ist er deaktiviert. Die Vorschläge entsprechen den Zonen des [NTP Pool Project](https://www.ntppool.org/en/use.html).
@@ -93,6 +101,7 @@ Für verlässlich höhere GPS-Genauigkeit unabhängig von NTP ist ein zugänglic
 - Während der 60 Sekunden nach erfolgreicher WLAN-Anmeldung über den AP `/`, `/dashboard` und eine Captive-Portal-Prüfadresse öffnen: alle müssen weiterhin das Setup zeigen bzw. dorthin umleiten. Gleichzeitig muss über die WLAN-IP die normale Statusoberfläche erreichbar sein.
 - Falsches Passwort und WLAN-Ausfall: Portal bleibt bzw. wird erneut erreichbar.
 - Unter freiem Himmel Satelliten und plausibles UTC-Datum prüfen.
+- Position und Höhe gegen einen bekannten Standort vergleichen. Im Satellitenhimmel müssen 0° Azimut oben und 90° rechts liegen; Satelliten bei 90° Elevation erscheinen in der Mitte. GPS-TX trennen: Position muss nach fünf Sekunden verschwinden, die Himmelsansicht nach zehn Sekunden.
 - Mit einem NTP-Client Synchronisationsstatus und Abweichung gegen eine unabhängige Quelle messen.
 - Bei laufendem GPS einen genauen NTP-Server eintragen: nach mindestens drei stabilen Vergleichen muss die Quelle auf GPS + NTP-Kalibrierung wechseln. Korrektur, Laufzeit, Streuung und NTP-Stratum prüfen. Den NTP-Server anschließend unerreichbar machen: spätestens nach Ablauf der Vergleichswerte muss die konservative GPS-Unsicherheit zurückkehren. Serverfeld leeren: Kalibrierung muss sofort verschwinden.
 - UART-Zeitkorrektur prüfen und die NTP-Abweichung gegen dieselbe unabhängige Referenz vor/nach dem Update vergleichen. Beim Laden der Webseite oder einer Netzsuche auf den Zähler verworfener GPS-Sätze achten; anschließend muss die Zeitübernahme wieder einsetzen.
@@ -112,6 +121,8 @@ g++ -std=c++11 -Wall -Wextra -Iinclude tests/nmea_timing_test.cpp -o /tmp/esp-nt
 /tmp/esp-ntp-nmea-test
 g++ -std=c++11 -Wall -Wextra -Iinclude tests/gps_calibration_test.cpp -o /tmp/esp-ntp-calibration-test
 /tmp/esp-ntp-calibration-test
+g++ -std=c++11 -Wall -Wextra -Iinclude tests/satellite_view_test.cpp -o /tmp/esp-ntp-satellite-test
+/tmp/esp-ntp-satellite-test
 ```
 
 Grundlagen: [u-blox NEO-6 Datenblatt](https://content.u-blox.com/sites/default/files/products/documents/NEO-6_DataSheet_%28GPS.G6-HW-09005%29.pdf), [TinyGPSPlus](https://github.com/mikalhart/TinyGPSPlus), [ESP8266 Arduino Core](https://github.com/esp8266/Arduino).

@@ -13,10 +13,12 @@
 #include "ntp_fallback.h"
 #include "nmea_timing.h"
 #include "gps_calibration.h"
+#include "satellite_view.h"
 
 // GPS TX -> D5. RX is not needed. All GPIO signals must be 3.3 V.
 SoftwareSerial gpsSerial(D5, -1);
 TinyGPSPlus gps;
+SatelliteView satelliteView;
 NmeaTiming gpsTiming;
 uint32_t gpsWireCorrectionUs = 0, gpsTimingRejected = 0, gpsOverflows = 0;
 GpsCalibration gpsCalibration;
@@ -24,7 +26,6 @@ uint32_t rawGpsSeconds = 0, rawGpsMicros = 0, lastNtpDelayUs = 0;
 bool gpsCalibrated = false, ntpMeasured = false;
 IPAddress calibrationAddress;
 uint8_t calibrationLeap = 0;
-TinyGPSCustom satellitesInView(gps, "GPGSV", 3);
 ESP8266WebServer web(80);
 DNSServer dns;
 WiFiUDP ntp;
@@ -142,13 +143,14 @@ void readGps() {
   // Decode the ISR buffer before checking whether it overflowed.
   gpsSerial.available();
   bool overflow = gpsSerial.overflow();
-  if (overflow) ++gpsOverflows;
+  if (overflow) { ++gpsOverflows; satelliteView.invalidateCycle(); }
   gpsTiming.service(micros(), overflow);
   // Bound work per loop so DNS, HTTP and NTP remain responsive.
   for (unsigned i = 0; i < 256 && gpsSerial.available(); ++i) {
     char c = gpsSerial.read();
     uint32_t receivedAt = micros();
     gpsTiming.observe(c, receivedAt);
+    satelliteView.encode(c, millis());
     if (!gps.encode(c) || !gpsTiming.isRmc()) continue;
     if (!gpsTiming.usable(receivedAt)) { ++gpsTimingRejected; continue; }
     if (!gps.time.isUpdated() || !gps.date.isUpdated() || !gps.date.isValid() || !gps.time.isValid() ||
@@ -276,6 +278,7 @@ const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset=
 <style>body{font:17px system-ui;background:#101b2d;color:#edf4ff;max-width:760px;margin:40px auto;padding:20px}section{background:#1c2c43;padding:24px;border-radius:16px;margin:18px 0}h1{margin-bottom:6px}dl{display:grid;grid-template-columns:1fr 1fr;gap:14px}dd{margin:0;text-align:right}input,button{font:inherit;padding:12px;box-sizing:border-box;border-radius:8px;border:0;margin:6px 0;width:100%}button{background:#72dcbd;color:#10251f;cursor:pointer}small{color:#bac8db}#message{color:#72dcbd}</style>
 <h1>GPS → NTP</h1><small>Wemos D1 mini · u-blox NEO-6M · UTC</small>
 <section><h2 id="state">Status wird geladen …</h2><dl id="values"></dl><small>Die Unsicherheit ist eine konservative Planungsannahme, keine gemessene Genauigkeit. Ohne PPS können NMEA-Verzögerungen die Zeit verschieben.</small></section>
+<section><h2>Position und Satellitenhimmel</h2><dl id="position"></dl><small>Koordinaten: WGS84. Nachkommastellen sind keine Genauigkeitsgarantie. Höhe über dem mittleren Meeresspiegel.</small><svg id="sky" viewBox="0 0 400 400" role="img" aria-label="Satellitenpositionen am Himmel" style="display:block;width:100%;max-width:440px;margin:auto"></svg><p id="skyState" role="status"></p><small>Norden oben, Osten rechts. Außenkreis: Horizont (0°), Mitte: Zenit (90°). Grün: Signalwert vorhanden; grau: kein Signalwert gemeldet. Die Ansicht zeigt Richtungen vom Empfänger aus, keine Satellitenentfernungen.</small><div style="overflow-x:auto"><table style="width:100%;text-align:left"><thead><tr><th>PRN</th><th>Azimut</th><th>Elevation</th><th>C/N₀</th></tr></thead><tbody id="satelliteRows"></tbody></table></div></section>
 <section><h2>Notfall-NTP und GPS-Kalibrierung</h2><form id="fallback"><label>NTP-Server (Hostname oder IPv4)<input id="fallbackHost" name="host" list="ntpServers" maxlength="63" placeholder="Leer = deaktiviert" autocomplete="off"></label><datalist id="ntpServers"><option value="pool.ntp.org"><option value="de.pool.ntp.org"></datalist><button>Notfall-NTP speichern</button></form><p id="fallbackMessage" role="status"></p><small>Der Server wird alle 30 Sekunden abgefragt: bei GPS-Empfang zur Kalibrierung, bei GPS-Ausfall als Ersatz. Ab drei stabilen Vergleichsmessungen wird die GPS-Zeit korrigiert. Ein naher, genauer NTP-Server verbessert die Voraussetzungen. Leer speichern deaktiviert auch die Kalibrierung. Millisekundengenauigkeit ist nicht garantiert.</small></section>
 <section><h2>Firmware aktualisieren</h2><form id="ota"><label>Firmware (.bin für D1 mini)<input id="firmware" type="file" accept=".bin" required></label><label>OTA-Passwort<input id="otaPassword" type="password" required autocomplete="off"></label><button>Firmware hochladen und neu starten</button></form><progress id="otaProgress" value="0" max="100" style="width:100%" hidden></progress><p id="otaMessage" role="status"></p><small>Das Standardpasswort steht in der README und kann unten geändert werden. WLAN und Notfall-NTP bleiben erhalten. Während des Updates die Stromversorgung aufrechterhalten.</small></section>
 <section><h2>OTA-Passwort ändern</h2><form id="changeOtaPassword"><label>Aktuelles Passwort<input id="currentOtaPassword" type="password" required autocomplete="current-password"></label><label>Neues Passwort<input name="password" id="newOtaPassword" type="password" minlength="8" maxlength="64" pattern="[!-~]{8,64}" required autocomplete="new-password"></label><label>Neues Passwort wiederholen<input name="confirmation" type="password" minlength="8" maxlength="64" required autocomplete="new-password"></label><button>OTA-Passwort speichern</button></form><p id="passwordMessage" role="status"></p><small>8–64 Zeichen: Buchstaben ohne Umlaute, Ziffern und ASCII-Sonderzeichen, keine Leerzeichen. Die Änderung gilt sofort und bleibt nach Neustart und WLAN-Reset erhalten.</small></section>
@@ -283,13 +286,17 @@ const char PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset=
 <script>
 const fields=[['utc','Zeit (UTC)'],['source','Aktive Zeitquelle'],['stratum','NTP-Stratum'],['satellites','Satelliten im Fix'],['visible','Satelliten sichtbar'],['hdop','HDOP (Position)'],['uncertainty','Geschätzte Unsicherheit'],['calibration','GPS-Kalibrierung'],['gpsOffset','GPS-Korrektur durch NTP'],['ntpDelay','NTP-Netzlaufzeit'],['calibrationSpread','Streuung der Vergleiche'],['wireCorrection','UART-Zeitkorrektur'],['timingRejected','Verzögerte GPS-Sätze verworfen'],['gpsOverflows','GPS-Pufferüberläufe'],['age','Letzte Zeitübernahme'],['fallbackHost','Notfall-NTP'],['fallbackState','Ersatzserver-Status'],['ip','WLAN-IP / NTP-Adresse'],['ap','Einrichtungs-AP'],['rssi','WLAN-Signal'],['requests','NTP-Antworten']];
 let configLoaded=false,resetting=false,updating=false;
+const svgNS='http://www.w3.org/2000/svg';
+function skyNode(tag,attrs,text){let el=document.createElementNS(svgNS,tag);for(let[k,v]of Object.entries(attrs))el.setAttribute(k,v);if(text!==undefined)el.textContent=text;document.querySelector('#sky').append(el);return el}
+function drawSky(s){document.querySelector('#sky').replaceChildren();for(let radius of [170,113.33,56.67])skyNode('circle',{cx:200,cy:200,r:radius,fill:'none',stroke:'#52657e'});skyNode('path',{d:'M30 200H370 M200 30V370',stroke:'#52657e'});for(let[label,x,y]of [['N',200,18],['O',388,206],['S',200,395],['W',12,206]])skyNode('text',{x,y,fill:'#edf4ff','text-anchor':'middle'},label);for(let sat of s.satellites){if(sat.azimuth===null||sat.elevation===null)continue;let angle=sat.azimuth*Math.PI/180,radius=170*(90-sat.elevation)/90,x=200+radius*Math.sin(angle),y=200-radius*Math.cos(angle);let point=skyNode('circle',{cx:x,cy:y,r:8,fill:sat.snr>0?'#72dcbd':'#8d99aa'});let title=document.createElementNS(svgNS,'title');title.textContent='PRN '+sat.id+' · '+sat.azimuth+'° · '+sat.elevation+'°';point.append(title);skyNode('text',{x:x+10,y:y-8,fill:'#edf4ff','font-size':12},String(sat.id))}let rows=document.querySelector('#satelliteRows');rows.replaceChildren();for(let sat of s.satellites){let tr=document.createElement('tr');for(let value of [sat.id,sat.azimuth===null?'—':sat.azimuth+'°',sat.elevation===null?'—':sat.elevation+'°',sat.snr===null?'—':sat.snr+' dB-Hz']){let td=document.createElement('td');td.textContent=value;tr.append(td)}rows.append(tr)}document.querySelector('#skyState').textContent=s.fresh?(s.satellites.length+' Satelliten gemeldet'):'Warte auf aktuelle Satellitendaten …'}
+async function refreshSky(){if(resetting||updating)return;try{let s=await(await fetch('/api/sky',{cache:'no-store'})).json();drawSky(s);let dl=document.querySelector('#position');dl.replaceChildren();for(let[label,value]of [['Breitengrad',s.positionValid?s.latitude.toFixed(6)+'°':'kein aktueller Fix'],['Längengrad',s.positionValid?s.longitude.toFixed(6)+'°':'—'],['Höhe',s.altitude===null?'—':s.altitude.toFixed(1)+' m'],['Alter der Position',s.positionAge===null?'—':(s.positionAge/1000).toFixed(1)+' s']]){let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;dl.append(dt,dd)}}catch(e){document.querySelector('#position').textContent='Position nicht erreichbar';drawSky({fresh:false,satellites:[]});document.querySelector('#skyState').textContent='Satellitendaten nicht erreichbar'}}
 async function refresh(){if(resetting||updating)return;try{let s=await(await fetch('/api/status',{cache:'no-store'})).json();document.querySelector('#state').textContent=s.synced?'Zeit verfügbar: '+s.source:'Nicht synchronisiert – warte auf Zeitquelle';if(!configLoaded){document.querySelector('#fallbackHost').value=s.fallbackHost==='deaktiviert'?'':s.fallbackHost;configLoaded=true}let dl=document.querySelector('#values');dl.replaceChildren();for(let[k,label]of fields){let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=s[k];dl.append(dt,dd)}}catch(e){document.querySelector('#state').textContent='Verbindung unterbrochen'}}
 document.querySelector('#ota').onsubmit=e=>{e.preventDefault();let file=document.querySelector('#firmware').files[0];if(!file||!file.size||!file.name.toLowerCase().endsWith('.bin')){document.querySelector('#otaMessage').textContent='Bitte eine nicht leere .bin-Datei auswählen.';return}if(!confirm('Firmware jetzt installieren und Gerät neu starten?'))return;updating=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);let progress=document.querySelector('#otaProgress'),message=document.querySelector('#otaMessage');progress.hidden=false;progress.value=0;message.textContent='Firmware wird hochgeladen …';let xhr=new XMLHttpRequest();xhr.open('POST','/update');xhr.timeout=180000;xhr.setRequestHeader('X-Device-Action','update');xhr.setRequestHeader('X-Update-Password',document.querySelector('#otaPassword').value);xhr.setRequestHeader('X-Firmware-Size',String(file.size));xhr.upload.onprogress=e=>{if(e.lengthComputable){progress.value=Math.round(e.loaded/e.total*100);message.textContent=progress.value===100?'Upload vollständig. Firmware wird geprüft …':'Upload: '+progress.value+' %'}};const unlock=()=>{updating=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)};xhr.onload=()=>{document.querySelector('#otaPassword').value='';message.textContent=xhr.responseText;if(xhr.status===200){resetting=true;message.textContent+=' Seite nach dem Neustart neu laden.'}else unlock()};xhr.onerror=xhr.ontimeout=xhr.onabort=()=>{message.textContent='Keine Bestätigung erhalten. Verbindung prüfen und Seite neu laden, bevor du erneut aktualisierst.';unlock()};let data=new FormData();data.append('firmware',file);xhr.send(data)};
 document.querySelector('#changeOtaPassword').onsubmit=async e=>{e.preventDefault();let form=e.target,data=new FormData(form),message=document.querySelector('#passwordMessage');if(data.get('password')!==data.get('confirmation')){message.textContent='Die neuen Passwörter stimmen nicht überein.';return}let button=form.querySelector('button');button.disabled=true;try{let r=await fetch('/ota-password',{method:'POST',headers:{'X-Device-Action':'change-password','X-Update-Password':document.querySelector('#currentOtaPassword').value},body:new URLSearchParams(data)});message.textContent=await r.text();if(r.ok){form.reset();document.querySelector('#otaPassword').value=''}}catch(e){message.textContent='Keine Bestätigung erhalten. Bei erneutem Versuch gegebenenfalls das neue Passwort verwenden.'}finally{button.disabled=false}};
 async function postForm(form,path,message,action){let button=form.querySelector('button');button.disabled=true;try{let r=await fetch(path,{method:'POST',headers:action?{'X-Device-Action':action}:{},body:new URLSearchParams(new FormData(form))});document.querySelector(message).textContent=await r.text();if(r.ok)refresh()}catch(e){document.querySelector(message).textContent='Verbindung unterbrochen'}finally{button.disabled=false}}
 document.querySelector('#fallback').onsubmit=e=>{e.preventDefault();postForm(e.target,'/fallback','#fallbackMessage','configure')};
 document.querySelector('#reset').onclick=async()=>{if(!confirm('WLAN-Zugangsdaten wirklich löschen und neu starten?'))return;let button=document.querySelector('#reset');button.disabled=true;try{let r=await fetch('/reset-wifi',{method:'POST',headers:{'X-Device-Action':'reset'}});document.querySelector('#resetMessage').textContent=await r.text();if(r.ok){resetting=true;document.querySelector('#state').textContent='Neustart – bitte mit dem Einrichtungs-AP verbinden.'}else button.disabled=false}catch(e){document.querySelector('#resetMessage').textContent='Keine Bestätigung erhalten. Verbindung prüfen.';button.disabled=false}};
-refresh();setInterval(refresh,2000);
+refresh();refreshSky();setInterval(()=>{refresh();refreshSky()},2000);
 </script></html>)HTML";
 
 const char SETUP_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WLAN einrichten · GPS NTP</title>
@@ -435,7 +442,7 @@ void status() {
   field("fallbackState", !fallbackHost.length() ? "deaktiviert" :
         WiFi.status() != WL_CONNECTED ? "warte auf WLAN" : fallbackState);
   field("satellites", gps.satellites.isValid() && gps.satellites.age() < 5000 ? String(gps.satellites.value()) : "—");
-  field("visible", satellitesInView.isValid() && satellitesInView.age() < 5000 ? String(satellitesInView.value()) : "—");
+  field("visible", satelliteView.fresh(millis()) ? String(satelliteView.count()) : "—");
   field("hdop", gps.hdop.isValid() && gps.hdop.age() < 5000 ? String(gps.hdop.hdop(), 1) : "—");
   field("uncertainty", synchronized() ? String(uncertaintyUs() / 1000.0, 2) + (networkTime || gpsCalibrated ? " ms (NTP-Schaetzung)" : " ms (ohne PPS)") : "unbekannt");
   field("calibration", gpsCalibration.ready(millis()) ? "bereit" : "nicht bereit (" + String(gpsCalibration.sampleCount()) + "/5 Messungen)");
@@ -489,6 +496,24 @@ void setup() {
              ",\"ip\":" + jsonString(connected ? WiFi.localIP().toString() : "") + "}");
   });
   web.on("/api/status", HTTP_GET, status);
+  web.on("/api/sky", HTTP_GET, [] {
+    bool positionValid = gps.location.isValid() && gps.location.age() < 5000;
+    bool fresh = satelliteView.fresh(millis());
+    String json = String("{\"positionValid\":") + (positionValid ? "true" : "false") +
+      ",\"latitude\":" + (positionValid ? String(gps.location.lat(), 6) : String("null")) +
+      ",\"longitude\":" + (positionValid ? String(gps.location.lng(), 6) : String("null")) +
+      ",\"altitude\":" + (positionValid && gps.altitude.isValid() && gps.altitude.age() < 5000 ? String(gps.altitude.meters(), 1) : String("null")) +
+      ",\"positionAge\":" + (gps.location.isValid() ? String(gps.location.age()) : String("null")) +
+      ",\"fresh\":" + (fresh ? "true" : "false") + ",\"satellites\":[";
+    if (fresh) for (unsigned i = 0; i < satelliteView.count(); ++i) {
+      const auto &sat = satelliteView.at(i);
+      if (i) json += ',';
+      json += "{\"id\":" + String(sat.id) + ",\"elevation\":" + (sat.elevation < 0 ? String("null") : String(sat.elevation)) +
+              ",\"azimuth\":" + (sat.azimuth < 0 ? String("null") : String(sat.azimuth)) +
+              ",\"snr\":" + (sat.snr < 0 ? String("null") : String(sat.snr)) + "}";
+    }
+    web.sendHeader("Cache-Control", "no-store"); web.send(200, "application/json", json + "]}");
+  });
   web.collectHeaders("X-Device-Action", "X-Update-Password", "X-Firmware-Size");
   web.on("/update", HTTP_POST, finishFirmware, uploadFirmware);
   web.on("/ota-password", HTTP_POST, [] {
