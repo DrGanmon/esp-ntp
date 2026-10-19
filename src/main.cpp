@@ -112,9 +112,19 @@ uint32_t otaLastActivity = 0, otaRestartAt = 0;
 String apName;
 bool portal = false, mdns = false;
 bool wifiWasConnected = false;
+bool portalCloseScheduled = false;
 uint32_t connectedSince = 0;
 uint32_t lastPortalAttempt = 0, lastDiagnostic = 0;
 bool portalAttempted = false;
+#ifndef ESP32
+bool setupWifiConnecting = false;
+void pauseSetupWifi() {
+  // The ESP8266 shares one radio: repeated station scans interrupt AP traffic.
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false); // Keep both the AP and saved credentials.
+  setupWifiConnecting = false;
+}
+#endif
 uint32_t disconnectedAt = 0, lastRetry = 0;
 uint32_t referenceSeconds = 0, referenceMicros = 0, lastSyncMillis = 0;
 uint32_t requests = 0;
@@ -555,15 +565,20 @@ void startPortal() {
   if (portalAttempted && uint32_t(millis() - lastPortalAttempt) < 5000) return;
   portalAttempted = true; lastPortalAttempt = millis();
   Serial.printf("[WLAN] Starte Einrichtungs-AP: %s\n", apName.c_str());
+#ifndef ESP32
+  if (WiFi.status() != WL_CONNECTED) pauseSetupWifi();
+#endif
   const IPAddress apIP(192, 168, 4, 1), mask(255, 255, 255, 0);
   if (!WiFi.mode(WIFI_AP_STA) || !WiFi.softAPConfig(apIP, apIP, mask) ||
       !WiFi.softAP(apName.c_str(), "gpssetup8266", 1, false, 4)) {
     Serial.println("[WLAN] AP-Start fehlgeschlagen; neuer Versuch in 5 Sekunden."); return;
   }
+  dns.setTTL(0);
   if (!dns.start(53, "*", WiFi.softAPIP())) {
     Serial.println("[WLAN] DNS-Start fehlgeschlagen; Setup direkt per http://192.168.4.1/ oeffnen.");
   }
   portal = true;
+  portalCloseScheduled = false;
   Serial.printf("Setup: %s / gpssetup8266 / 192.168.4.1\n", apName.c_str());
 }
 void status() {
@@ -804,6 +819,9 @@ void setup() {
     }
     web.send(200, "text/plain; charset=utf-8", "Gespeichert. Verbindung wird aufgebaut; Status zeigt die neue IP.");
     WiFi.persistent(true); WiFi.begin(ssid.c_str(), password.c_str()); WiFi.persistent(false);
+#ifndef ESP32
+    setupWifiConnecting = true;
+#endif
     disconnectedAt = millis(); lastRetry = millis();
   });
   web.onNotFound([] {
@@ -870,18 +888,44 @@ void networkLoop() {
 #endif
   pollFallback();
   if (networkConnected()) {
+#ifndef ESP32
+    setupWifiConnecting = false;
+    WiFi.setAutoReconnect(true);
+#endif
     if (!wifiWasConnected) {
-      connectedSince = millis(); wifiWasConnected = true;
+      wifiWasConnected = true;
       Serial.printf("[WLAN] Verbunden. Statusseite: http://%s/\n", networkIP().toString().c_str());
     }
     disconnectedAt = millis();
     if (!mdns) { mdns = MDNS.begin("gps-ntp"); if (mdns) { MDNS.addService("http", "tcp", 80); MDNS.addService("ntp", "udp", 123); } }
-    // Keep setup accessible for 60 s after connection, then close the AP.
-    if (portal && millis() - connectedSince > 60000) { dns.stop(); WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); WiFi.scanDelete(); portal = false; }
+    // Arm once per portal session; brief station outages must not restart the timer.
+    if (portal && !portalCloseScheduled) {
+      connectedSince = millis(); portalCloseScheduled = true;
+    }
+    if (portal && uint32_t(millis() - connectedSince) >= 60000) {
+      // Disable only the AP. Keep its state until the mode change succeeds so
+      // a failed shutdown is retried instead of leaving an untracked AP running.
+      if (WiFi.mode(WIFI_STA)) {
+        dns.stop(); WiFi.scanDelete(); portal = false;
+        portalCloseScheduled = false;
+        Serial.println("[WLAN] Einrichtungs-AP nach erfolgreicher Verbindung abgeschaltet.");
+      }
+    }
   } else {
     wifiWasConnected = false;
     if (millis() - disconnectedAt > 20000) startPortal();
+#ifdef ESP32
     if (millis() - lastRetry > 30000) { WiFi.reconnect(); lastRetry = millis(); }
+#else
+    if (portal) {
+      if (setupWifiConnecting && uint32_t(millis() - lastRetry) >= 20000) {
+        pauseSetupWifi();
+        Serial.println("[WLAN] Verbindung fehlgeschlagen; Setup bleibt ohne weitere Verbindungsversuche erreichbar.");
+      }
+    } else if (millis() - lastRetry > 30000) {
+      WiFi.reconnect(); lastRetry = millis();
+    }
+#endif
     if (mdns) {
 #ifdef ESP32
       MDNS.end();
